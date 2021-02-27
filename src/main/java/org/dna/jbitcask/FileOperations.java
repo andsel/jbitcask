@@ -638,11 +638,31 @@ class FileOperations {
     }
 
     /**
+     * Close a file for writing, but leave it open for reads.
+     *
+     * @param fileState*/
+    public static FileState closeForWriting(FileState fileState) throws IOException {
+        final FileState state = closeHintfile(fileState);
+        fileState.fd.force(false);
+        return new FileState(OpenMode.READONLY, state.filename, state.timestamp, state.fd, state.ofs,
+                state.hintcrc, state.hintfd);
+    }
+
+    /**
      * Use when done writing a file.  (never open for writing again)
      * */
     public static void close(FileState fileState) throws IOException {
         closeHintfile(fileState);
         fileState.fd.close();
+    }
+
+    /**
+     * Use when closing multiple files.  (never open for writing again)
+     * */
+    public static void closeAll(List<FileState> fileStates) throws IOException {
+        for (FileState state : fileStates) {
+            close(state);
+        }
     }
 
     private static FileState closeHintfile(FileState fileState) throws IOException {

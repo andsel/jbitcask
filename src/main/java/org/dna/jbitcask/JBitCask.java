@@ -68,9 +68,9 @@ public class JBitCask {
 
     // Bitcask instance state
     private String dirname;
-    private List<String> readFiles;
-    private File writeFile;
-    private Lock writeLock;
+    private List<FileState> readFiles;
+    private FileState writeFile;
+    private IO.BCFileLock writeLock;
     private long maxFileSize;
     //TODO opts
     private Keydir keydir;
@@ -88,7 +88,7 @@ public class JBitCask {
             throw new FileNotFoundException("bitcask directory doesn't exists: " + path);
         }
 
-        File writingFile = null;
+        FileState writingFile = null;
 
         // If the read_write option is set, attempt to release any stale write lock.
         // Do this first to avoid unnecessary processing of files for reading.
@@ -257,7 +257,7 @@ public class JBitCask {
         FileOperations.foldKeys(fileState, new FileOperations.KeyFoldFunction<KeyFoldMode>() {
             @Override
             public KeyFoldMode fold(boolean tombstone, byte[] key, long timestamp, long offset, long totalSize, KeyFoldMode dontcare) {
-                if (tombstone ) {
+                if (tombstone) {
                     try {
                         final byte[] tranformedKey = keyTransformer.apply(key);
                         keydir.keydirRemove(keyTransformer.apply(tranformedKey));
@@ -295,14 +295,14 @@ public class JBitCask {
         // Check the write and/or merge locks to see what files are currently
         // being written to. Generate our list excepting those.
         final String writingFile = LockOperations.readActivefile(LockType.WRITE, dirname);
-        final String mergingFile = LockOperations.readActivefile(LockType.WRITE, dirname);
+        final String mergingFile = LockOperations.readActivefile(LockType.MERGE, dirname);
 
         // Filter out files with setuid bit set: they've been marked for
         // deletion by an earlier *successful* merge.
         final List<Path> fs = listDataFiles(dirname, writingFile, mergingFile);
 
         final String writingFile2 = LockOperations.readActivefile(LockType.WRITE, dirname);
-        final String mergingFile2 = LockOperations.readActivefile(LockType.WRITE, dirname);
+        final String mergingFile2 = LockOperations.readActivefile(LockType.MERGE, dirname);
         if (writingFile.equals(writingFile2) && mergingFile.equals(mergingFile2)) {
             return fs.stream().collect(Collectors.partitioningBy(f -> ! JBitCask.hasPendingDeleteBit(f)));
         } else {
@@ -414,5 +414,23 @@ public class JBitCask {
         byte[] dst = new byte[TOMBSTONE_PREFIX.length()];
         data.mark().get(dst).reset();
         return TOMBSTONE_PREFIX.equals(new String(dst));
+    }
+
+    /**
+     * Close a bitcask data store and flush any pending writes to disk.
+     */
+    public void close() throws IOException {
+        if (writeFile != null) {
+            // TODO check it is not fresh
+            //Cleanup the write file and associated lock
+            FileOperations.closeForWriting(writeFile);
+            LockOperations.release(writeLock);
+        }
+        // Manually release the keydir. If, for some reason, this failed GC would
+        // still get the job done.
+        keydir.release();
+
+        // Clean up all the reading files
+        FileOperations.closeAll(readFiles);
     }
 }
