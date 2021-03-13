@@ -203,13 +203,17 @@ final class Keydir {
     /**
      * @return the new fileId
      * */
-    public long incrementFileId(Long id) {
+    public long incrementFileId() {
+        return incrementFileId(0L);
+    }
+
+    public long incrementFileId(Long conditionalFileId) {
         mutex.lock();
-        if (id == null) {
+        if (conditionalFileId == null || conditionalFileId == 0) {
             biggestFileId++;
         } else {
-            if (id > biggestFileId) {
-                biggestFileId = id;
+            if (conditionalFileId > biggestFileId) {
+                biggestFileId = conditionalFileId;
             }
         }
         long newId = biggestFileId;
@@ -225,48 +229,79 @@ final class Keydir {
         int removeTime = 0;
         mutex.lock();
         this.epoch += 1;
+        LOG.debug("+++ Remove");
         perhapsSweepSiblings();
         final FindResult fr = findKeydirEntry(key, this.epoch);
         if (!fr.found || fr.proxy.isTombstone) {
             // not found
             mutex.unlock();
             return;
-        } else {
-            // Remove the key from the keydir stats
-            keyCount --;
-            keyBytes -= fr.proxy.key.length;
-            if (keyfolders > 0) {
-                iterMutation = 1;
-            }
+        }
+        dokeydirRemove(key, removeTime, fr);
+        mutex.unlock();
+    }
 
-            // Remove from file stats
-            updateFstats(fr.proxy.fileId, fr.proxy.tstamp, MAX_EPOCH, -1, 0, -fr.proxy.totalSize,
-                    0, false);
-
-            // If found an entry in the pending hash, convert it to a tombstone
-            if (fr.pendingEntry != null) {
-                System.out.println("LINE 201 pending put");
-                fr.pendingEntry.setPendingTombstone();
-                fr.pendingEntry.tstamp = removeTime;
-                fr.pendingEntry.epoch = this.epoch;
-            } else if (this.pending != null) {
-                // If frozen, add tombstone to pending hash (iteration must have
-                // started between put/remove call in bitcask:delete.
-                final KeydirEntry pendingEntry = new KeydirEntry(fr.proxy);
-                pendingEntry.setPendingTombstone();
-                pendingEntry.tstamp = removeTime;
-                pendingEntry.epoch = this.epoch;
-                pending.put(key, pendingEntry);
-            } else if(this.keyfolders == 0) {
-                // If not iterating, just remove.
-                this.entries.remove(key);
-            } else {
-                // else found in entries while iterating
-                setEntryTombstone(key, fr.entriesEntry, removeTime, this.epoch);
-            }
+    // This is a conditional removal. We
+    // only want to actually remove the entry if the tstamp, fileid and
+    // offset matches the one provided. A sort of poor-man's CAS.
+    public void keydirRemove(byte[] key, long timestamp, int fileId, long offset) {
+        int removeTime = 0;
+        mutex.lock();
+        this.epoch += 1;
+        LOG.debug("+++ Remove conditional");
+        perhapsSweepSiblings();
+        final FindResult fr = findKeydirEntry(key, this.epoch);
+        if (!fr.found || fr.proxy.isTombstone) {
+            // not found
             mutex.unlock();
             return;
         }
+        // conditional remove, bail if not a match.
+        if (fr.proxy.tstamp != timestamp ||
+                fr.proxy.fileId != fileId ||
+                fr.proxy.offset != offset) {
+            mutex.unlock();
+            LOG.debug("+++Conditional no match");
+            throw new AlreadyExistsError();
+        }
+        dokeydirRemove(key, removeTime, fr);
+        mutex.unlock();
+    }
+
+    private void dokeydirRemove(byte[] key, int removeTime, FindResult fr) {
+        // Remove the key from the keydir stats
+        keyCount --;
+        keyBytes -= fr.proxy.key.length;
+        if (keyfolders > 0) {
+            iterMutation = 1;
+        }
+
+        // Remove from file stats
+        updateFstats(fr.proxy.fileId, fr.proxy.tstamp, MAX_EPOCH, -1, 0, -fr.proxy.totalSize,
+                0, false);
+
+        // If found an entry in the pending hash, convert it to a tombstone
+        if (fr.pendingEntry != null) {
+            System.out.println("LINE 201 pending put");
+            fr.pendingEntry.setPendingTombstone();
+            fr.pendingEntry.tstamp = removeTime;
+            fr.pendingEntry.epoch = this.epoch;
+        } else if (this.pending != null) {
+            // If frozen, add tombstone to pending hash (iteration must have
+            // started between put/remove call in bitcask:delete.
+            final KeydirEntry pendingEntry = new KeydirEntry(fr.proxy);
+            pendingEntry.setPendingTombstone();
+            pendingEntry.tstamp = removeTime;
+            pendingEntry.epoch = this.epoch;
+            pending.put(key, pendingEntry);
+        } else if(this.keyfolders == 0) {
+            // If not iterating, just remove.
+            this.entries.remove(key);
+        } else {
+            // else found in entries while iterating
+            setEntryTombstone(key, fr.entriesEntry, removeTime, this.epoch);
+        }
+        LOG.debug("Removed");
     }
 
     // Adds a tombstone to an existing entries hash entry. Regular entries are
@@ -291,7 +326,7 @@ final class Keydir {
         }
     }
 
-    private void updateFstats(int fileId, long tstamp, long expirationEpoch, int liveIncrement,
+    void updateFstats(int fileId, long tstamp, long expirationEpoch, int liveIncrement,
                               int totalIncrement, int liveBytesIncrement, int totalBytesIncrement, boolean shouldCreate) {
         FstatsEntry entry = fstats.get(fileId);
         if (entry == null) {
@@ -517,7 +552,7 @@ final class Keydir {
     }
 
     public void keydirPut(byte[] key, int fileId, int totalSize, long offset, long timestamp, long nowSeconds,
-                          boolean newestPut, Integer oldFileId, Integer oldOffset) {
+                          boolean newestPut, Integer oldFileId, Integer oldOffset) throws AlreadyExistsError {
         if (oldFileId != null && oldOffset == null) {
             throw new IllegalArgumentException("When oldFileId is provided also oldOffset must be present");
         }
@@ -539,7 +574,7 @@ final class Keydir {
         if ((!f.found || f.proxy.isTombstone) && oldFileId != null) {
             LOG.debug("file already exists");
             mutex.unlock();
-            return;
+            throw new AlreadyExistsError();
         }
 
         this.epoch += 1; //don't worry about backing this out if we bail
@@ -556,7 +591,7 @@ final class Keydir {
             if ((newestPut && (entry.fileId < biggestFileId)) || oldFileId != null) {
                 mutex.unlock();
                 // already exists
-                return;
+                throw new AlreadyExistsError();
             }
             keyCount ++;
             keyBytes += key.length;
@@ -633,7 +668,7 @@ final class Keydir {
             }
             mutex.unlock();
             LOG.debug("No update");
-            return; // already exists
+            throw new AlreadyExistsError();
         }
     }
 
@@ -696,6 +731,26 @@ final class Keydir {
             // keydir, since it may take a while to walk a large keydir and free each
             // entry.
             PRIV.globalKeydirsLock.unlock();
+        }
+    }
+
+    public EntryProxy get(byte[] key) throws KeyNotFoundError {
+        return get(key, 0xffff_ffff_ffff_ffffL);
+    }
+
+    public EntryProxy get(byte[] key, long epoch) throws KeyNotFoundError {
+        mutex.lock();
+        perhapsSweepSiblings();
+        final FindResult f = findKeydirEntry(key, epoch);
+        if (f.found && !f.proxy.isTombstone) {
+            LOG.debug(" ... returned value file id=%d size=%d ofs=%d tstamp=%d tomb=%s",
+                    f.proxy.fileId, f.proxy.totalSize, f.proxy.offset, f.proxy.tstamp, f.proxy.isTombstone);
+            mutex.unlock();
+            return f.proxy;
+        } else {
+            LOG.debug(" ... not found");
+            mutex.unlock();
+            throw new KeyNotFoundError();
         }
     }
 }

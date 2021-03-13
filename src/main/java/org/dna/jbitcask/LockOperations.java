@@ -14,7 +14,7 @@ class LockOperations {
 
     enum DeleteStaleLockResult { OK, NOT_STALE;}
 
-    enum LockType {MERGE, WRITE;}
+    enum LockType {MERGE, WRITE, CREATE}
 
     enum AcquireResult {LOCKED;}
     /**
@@ -158,5 +158,13 @@ class LockOperations {
         } catch (IOException ex) {
             return null;
         }
+    }
+
+    /**
+     * Write a new active filename to an open lockfile.
+     * */
+    static void writeActivefile(IO.BCFileLock lock, String activeFilename) throws IOException {
+        final String content = ProcessHandle.current().pid() + " " + activeFilename + "\n";
+        IO.lockWritedata(lock, content);
     }
 }

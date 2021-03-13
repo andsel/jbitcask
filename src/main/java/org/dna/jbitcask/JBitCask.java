@@ -4,7 +4,6 @@ import org.dna.jbitcask.FileOperations.FileState;
 import org.dna.jbitcask.FileOperations.KeyFoldMode;
 import org.dna.jbitcask.LockOperations.LockType;
 
-import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -18,7 +17,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.locks.Lock;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.Logger;
@@ -26,6 +24,39 @@ import org.apache.logging.log4j.LogManager;
 import java.util.stream.Collectors;
 
 public class JBitCask {
+
+    // Bitcask instance state
+    private static class BitcaskState {
+        private String dirname;
+        private List<FileState> readFiles;
+        private FileState writeFile; // <fd>|null|fresh
+        private IO.BCFileLock writeLock;
+        private long maxFileSize;
+        private Options opts;
+        private Keydir keydir;
+
+        public BitcaskState(String dirname, List<FileState> readFiles, FileState writeFile,
+                            IO.BCFileLock writeLock, long maxFileSize, Options opts, Keydir keydir) {
+            this.dirname = dirname;
+            this.readFiles = readFiles;
+            this.writeFile = writeFile;
+            this.writeLock = writeLock;
+            this.maxFileSize = maxFileSize;
+            this.opts = opts;
+            this.keydir = keydir;
+        }
+
+        // copy constructor
+        public BitcaskState(BitcaskState other) {
+            this.dirname = other.dirname;
+            this.readFiles = other.readFiles;
+            this.writeFile = other.writeFile;
+            this.writeLock = other.writeLock;
+            this.maxFileSize = other.maxFileSize;
+            this.keydir = other.keydir;
+            this.opts = other.opts;
+        }
+    }
 
     private static final Logger LOG = LogManager.getLogger(JBitCask.class);
 
@@ -42,6 +73,8 @@ public class JBitCask {
     static final int TOMBSTONE2_SIZE = TOMBSTONE2_BIN.length + 4;
     // Change this to the largest size a tombstone value can have if more added.
     static final int MAX_TOMBSTONE_SIZE = TOMBSTONE2_SIZE;
+
+    static final int DIABOLIC_BIG_INT = 100;
 
     // Notice that tombstone version 1 and 2 are the same size, so not tested below
     static boolean isTombstoneSize(int s) {
@@ -66,23 +99,17 @@ public class JBitCask {
     public static final int MIN_CHUNK_SIZE = 1024;
     public static final int MAX_CHUNK_SIZE = 134217728;
 
-    // Bitcask instance state
-    private String dirname;
-    private List<FileState> readFiles;
-    private FileState writeFile;
-    private IO.BCFileLock writeLock;
-    private long maxFileSize;
-    //TODO opts
-    private Keydir keydir;
+    private BitcaskState state;
+
     private Function<byte[], byte[]> keyTransform;
     private byte tombstoneVersion;
     private boolean readWriteP;
 
     public static JBitCask open(String dirname) throws IOException, InterruptedException, TimeoutException {
-        return open(dirname, new Properties());
+        return open(dirname, new Options(new Properties()));
     }
 
-    public static JBitCask open(String dirname, Properties opts) throws IOException, InterruptedException, TimeoutException {
+    public static JBitCask open(String dirname, Options opts) throws IOException, InterruptedException, TimeoutException {
         final Path path = Paths.get(dirname, "bitcask");
         if (!path.toFile().exists()) {
             throw new FileNotFoundException("bitcask directory doesn't exists: " + path);
@@ -92,7 +119,7 @@ public class JBitCask {
 
         // If the read_write option is set, attempt to release any stale write lock.
         // Do this first to avoid unnecessary processing of files for reading.
-        if ((Boolean) opts.getOrDefault("read_write", Boolean.FALSE)) {
+        if (opts.get(Options.READ_WRITE)) {
             // If the lock file is not stale, we'll continue initializing
             // and loading anyway: if later someone tries to write
             // something, that someone will get a write_locked exception.
@@ -104,17 +131,17 @@ public class JBitCask {
         }
 
         // Get the max file size parameter from opts
-        final Long maxFileSize = getOption("max_file_size", opts);
+        final Long maxFileSize = opts.get(Options.MAX_FILE_SIZE);
 
         // Get the number of seconds we are willing to wait for the keydir init to timeout
-        final Long waitMillis = getOption("open_timeout", opts);
+        final Long waitMillis = opts.get(Options.OPEN_TIMEOUT);
         final long waitTime = waitMillis / 1000;
 
         // Set the key transform for this cask
         Function<byte[], byte[]> keyTransformer = getKeyTransform(); //opts key_transform
 
         //Type of tombstone to write, for testing.
-        byte tombstoneVersion = getOption("tombstone_version", opts); // 0 or 2
+        byte tombstoneVersion = opts.get(Options.TOMBSTONE_VERSION); // 0 or 2
 
         // Loop and wait for the keydir to come available.
         boolean readWriteP = writingFile != null;
@@ -125,15 +152,10 @@ public class JBitCask {
             readWriteI = false;
 
         final Keydir keydir = initKeydir(dirname, waitTime, readWriteP, keyTransformer);
+        // Ensure that expiry_secs is in Opts and not just application env
+        opts.add(Options.EXPIRY_SECS, opts.get(Options.EXPIRY_SECS));
         final JBitCask bc = new JBitCask();
-        bc.dirname = dirname;
-        bc.readFiles = new ArrayList<>();
-        bc.writeFile = writingFile; // <fd>|null|fresh
-        bc.writeLock = null;
-        bc.maxFileSize = maxFileSize;
-        //TODO
-//        bc.opts = extOpt;
-        bc.keydir = keydir;
+        bc.state = new BitcaskState(dirname, new ArrayList<>(), writingFile, null, maxFileSize, opts, keydir);
         bc.keyTransform = keyTransformer;
         bc.tombstoneVersion = tombstoneVersion;
         bc.readWriteP = readWriteI;
@@ -143,7 +165,8 @@ public class JBitCask {
     /*
      * Initialize a keydir for a given directory.
      * */
-    private static Keydir initKeydir(String dirname, long waitTimeSecs, boolean readWriteMode, Function<byte[], byte[]> keyTransformer) throws IOException, InterruptedException, TimeoutException {
+    private static Keydir initKeydir(String dirname, long waitTimeSecs, boolean readWriteMode,
+                                     Function<byte[], byte[]> keyTransformer) throws IOException, InterruptedException, TimeoutException {
         // Get the named keydir for this directory. If we get it and it's already
         // marked as ready, that indicates another caller has already loaded
         // all the data from disk and we can short-circuit scanning all the files.
@@ -406,31 +429,190 @@ public class JBitCask {
         return (byte[] key) -> key;
     }
 
-    private static <T> T getOption(String propName, Properties opts) {
-        return (T) opts.getOrDefault(propName, System.getenv(propName));
-    }
-
     static boolean isTombstone(ByteBuffer data) {
         byte[] dst = new byte[TOMBSTONE_PREFIX.length()];
         data.mark().get(dst).reset();
         return TOMBSTONE_PREFIX.equals(new String(dst));
     }
 
+    static boolean isTombstone(byte[] data) {
+        return TOMBSTONE_PREFIX.equals(new String(data));
+    }
+
     /**
      * Close a bitcask data store and flush any pending writes to disk.
      */
     public void close() throws IOException {
-        if (writeFile != null) {
+        if (state.writeFile != null) {
             // TODO check it is not fresh
             //Cleanup the write file and associated lock
-            FileOperations.closeForWriting(writeFile);
-            LockOperations.release(writeLock);
+            FileOperations.closeForWriting(state.writeFile);
+            LockOperations.release(state.writeLock);
         }
         // Manually release the keydir. If, for some reason, this failed GC would
         // still get the job done.
-        keydir.release();
+        state.keydir.release();
 
         // Clean up all the reading files
-        FileOperations.closeAll(readFiles);
+        FileOperations.closeAll(state.readFiles);
+    }
+
+    /**
+     * Store a key and value in a Bitcask datastore.
+     * */
+    public void put(byte[] key, byte[] value) throws IOException, LockOperations.AlreadyLockedException, InterruptedException {
+        // Make sure we have a file open to write
+        if (this.state.writeFile == null) {
+            throw new ReadOnlyError();
+        }
+        this.state = doPut(key, value, this.state, DIABOLIC_BIG_INT, null);
+    }
+
+    // Internal put - have validated that the file is opened for write
+    // and looked up the state at this point
+    private BitcaskState doPut(byte[] key, byte[] value, BitcaskState state, int retries, BitCaskError lastError)
+            throws IOException, LockOperations.AlreadyLockedException, InterruptedException {
+        if (retries == 0) {
+            throw lastError;
+        }
+        final int valSize;
+        if (isTombstone(value)) {
+            valSize = tombstoneSizeForVersion();
+        } else {
+            valSize = value.length;
+        }
+        final FileOperations.WriteResponse res = FileOperations.checkWrite(state.writeFile, key, valSize, state.maxFileSize);
+        BitcaskState state2;
+        switch (res) {
+            case WRAP -> state2 = wrapWriteFile(this.state);
+            case FRESH -> {
+                final IO.BCFileLock writeLock = LockOperations.acquire(LockType.WRITE, state.dirname);
+                final FileState newWriteFile = FileOperations.createFile(state.dirname, state.opts, state.keydir);
+                LockOperations.writeActivefile(writeLock, newWriteFile.getFilename());
+                state.writeFile = newWriteFile;
+                state.writeLock = writeLock;
+                state2 = state;
+            }
+            case OK -> state2 = state;
+            default -> throw new IllegalArgumentException();
+        }
+        final long timestamp = System.currentTimeMillis();
+        final FileState writeFile0 = state2.writeFile;
+        final long writeFileId = FileOperations.fileTimestamp(writeFile0);
+        BitcaskState state3;
+        if (JBitCask.isTombstone(value)) {
+            final Keydir.EntryProxy entry;
+            try {
+                entry = state2.keydir.get(key);
+            } catch (KeyNotFoundError notfund) {
+                return state2;
+            }
+            final int oldFileId = entry.fileId;
+            if (oldFileId > writeFileId) {
+                // A merge wrote this key in a file > current write file
+                // Start a new write file > the merge output file
+                state3 = wrapWriteFile(state2);
+                return doPut(key, value, state3, retries - 1, new AlreadyExistsError());
+            } else {
+                final long oldTimestamp = entry.tstamp;
+                final long oldOffset = entry.offset;
+                final ByteBuffer tombstone = ByteBuffer.allocate(TOMBSTONE2_SIZE);
+                tombstone.put(TOMBSTONE2_STR.getBytes()).putInt(oldFileId).flip();
+                final FileOperations.WriteResult writeRes = FileOperations.write(state2.writeFile, key, tombstone.array(), timestamp);
+                final FileState writeFile2 = writeRes.fileState;
+                final int tombstoneSize = writeRes.size;
+                state2.keydir.updateFstats((int) FileOperations.fileTimestamp(writeFile2), timestamp,
+                        0, 0, 0, 0, tombstoneSize, true);
+                try {
+                    state2.keydir.keydirRemove(key, oldTimestamp, oldFileId, oldOffset);
+                    state2.writeFile = writeFile2;
+                    return state2;
+                } catch (AlreadyExistsError err) {
+                    // Merge updated the keydir after tombstone
+                    // write.  beat us, so undo and retry in a
+                    // new file.
+                    FileState writeFile3 = FileOperations.unWrite(writeFile2);
+                    state2.writeFile = writeFile3;
+                    state3 = wrapWriteFile(state2);
+                    return doPut(key, value, state3, retries - 1, new AlreadyExistsError());
+                }
+            }
+        } else {
+            // Replacing value from a previous file, so write tombstone for it.
+            final Keydir.EntryProxy entry;
+            try {
+                entry = state2.keydir.get(key);
+            } catch (KeyNotFoundError notfound) {
+                state3 = new JBitCask.BitcaskState(state2);
+                state3.writeFile = writeFile0;
+                return writeAndKeydirPut(state3, key, value, timestamp, retries, System.currentTimeMillis(), 0, 0);
+            }
+            final int oldFileId = entry.fileId;
+            if (oldFileId > writeFileId) {
+                state3 = wrapWriteFile(state2);
+                return doPut(key, value, state3, retries - 1, new AlreadyExistsError());
+            } else {
+                if (oldFileId < writeFileId) {
+                    final ByteBuffer prevTombstone = ByteBuffer.allocate(TOMBSTONE2_SIZE);
+                    prevTombstone.put(TOMBSTONE2_STR.getBytes()).putInt(oldFileId).flip();
+                    final FileOperations.WriteResult writeRes = FileOperations.write(state2.writeFile, key, prevTombstone.array(), timestamp);
+                    state3 = new JBitCask.BitcaskState(state2);
+                    state3.writeFile = writeRes.fileState;
+                } else {
+                    state3 = state2;
+                }
+                final long oldOffset = entry.offset;
+                return writeAndKeydirPut(state3, key, value, timestamp, retries, System.currentTimeMillis(), oldFileId, oldOffset);
+            }
+        }
+    }
+
+    private BitcaskState writeAndKeydirPut(BitcaskState state, byte[] key, byte[] value, long timestamp, int retries,
+                                           long nowTimestamp, int oldFileId, long oldOffset) throws IOException, LockOperations.AlreadyLockedException, InterruptedException {
+        final FileOperations.WriteResult writeResult = FileOperations.write(state.writeFile, key, value, timestamp);
+        final int fileTimestamp = (int) FileOperations.fileTimestamp(writeResult.fileState);
+
+        try {
+            state.keydir.keydirPut(key, fileTimestamp, writeResult.size, writeResult.offset,
+                    timestamp, nowTimestamp, true, oldFileId, (int) oldOffset);
+            final BitcaskState newState = new BitcaskState(state);
+            newState.writeFile = writeResult.fileState;
+            return newState;
+        } catch (AlreadyExistsError e) {
+            // Assuming the timestamps in the keydir are
+            // valid, there is an edge case where the merge thread
+            // could have rewritten this Key to a file with a greater
+            // file_id. Rather than synchronize the merge/writer processes,
+            // wrap to a new file with a greater file_id and rewrite
+            // the key there.
+            // We must undo the write here so a later partial merge
+            // does not see it.
+            // Limit the number of recursions in case there is
+            // a different issue with the keydir.
+            FileState writeFile3 = FileOperations.unWrite(writeResult.fileState);
+            final BitcaskState newState = new BitcaskState(state);
+            newState.writeFile = writeFile3;
+            final BitcaskState state3 = wrapWriteFile(newState);
+            return doPut(key, value, state3, retries - 1, new AlreadyExistsError());
+        }
+    }
+
+    private BitcaskState wrapWriteFile(BitcaskState state) throws IOException, InterruptedException {
+        final FileState writeFile = state.writeFile;
+        final FileState lastWriteFile = FileOperations.closeForWriting(writeFile);
+        final FileState newWriteFile = FileOperations.createFile(state.dirname, state.opts, state.keydir);
+        LockOperations.writeActivefile(state.writeLock, newWriteFile.getFilename());
+
+        state.writeFile = newWriteFile;
+        state.readFiles.add(0, lastWriteFile);
+        return state;
+    }
+
+    private int tombstoneSizeForVersion() {
+        return switch (tombstoneVersion) {
+            case 0 -> TOMBSTONE0_SIZE;
+            case 2 -> TOMBSTONE2_SIZE;
+            default -> throw new IllegalArgumentException("tombstone version must be 0 or 2, received: " + tombstoneVersion);
+        };
     }
 }

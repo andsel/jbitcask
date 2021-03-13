@@ -8,15 +8,18 @@ import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -71,9 +74,9 @@ class FileOperations {
         private final long ofs; //Current offset for writing
         private final long hintcrc; //CRC-32 of current hint
         private final FileChannel hintfd; //File handle for hints
-//        l_ofs=0 :: non_neg_integer(),  % Last offset written to data file
-//        l_hbytes=0 :: non_neg_integer(),% Last # bytes written to hint file
-//        l_hintcrc=0 :: non_neg_integer()}). % CRC-32 of current hint prior to last write
+        private long lastOfs = 0; // Last offset written to data file
+        private long lastHintBytes = 0; // Last # bytes written to hint file
+        private int lastHintCrc = 0; // CRC-32 of current hint prior to last write
 
         FileState(OpenMode mode, String filename, long tstamp, FileChannel fd, long ofs) {
             this(mode, filename, tstamp, fd, ofs, 0, null);
@@ -89,6 +92,20 @@ class FileOperations {
             this.hintfd = hintfd;
         }
 
+        public FileState(OpenMode mode, String filename, long tstamp, FileChannel fd, long ofs, long hintcrc, FileChannel hintfd,
+                         long lastOfs, long lastHintBytes, int lastHintCrc) {
+            this.mode = mode;
+            this.filename = filename;
+            this.timestamp = tstamp;
+            this.fd = fd;
+            this.ofs = ofs;
+            this.hintcrc = hintcrc;
+            this.hintfd = hintfd;
+            this.lastOfs = lastOfs;
+            this.lastHintBytes = lastHintBytes;
+            this.lastHintCrc = lastHintCrc;
+        }
+
 
         public long getTimestamp() {
             return timestamp;
@@ -97,6 +114,66 @@ class FileOperations {
         public boolean hasFileDescriptor() {
             return fd != null;
         }
+
+        public String getFilename() {
+            return filename;
+        }
+    }
+
+    /**
+     * Open a new file for writing.
+     * Called on a Dirname, will open a fresh file in that directory.
+     * */
+    static FileState createFile(String dirname, Options opts, Keydir keydir) throws IOException, InterruptedException {
+        final IO.BCFileLock lock;
+        try {
+            lock = getCreateLock(dirname);
+        } catch (IOException | InterruptedException ex) {
+            throw ex;
+        }
+        try {
+            final long newest = keydir.incrementFileId();
+            final String filename = mkFilename(dirname, newest);
+            ensureDir(filename);
+
+            // Check for o_sync strategy and add to opts
+            Set<OpenOption> options = new HashSet<>();
+            options.add(StandardOpenOption.CREATE_NEW);
+            options.add(StandardOpenOption.WRITE);
+            if (opts.get(Options.SYNC_STRATEGY)) {
+                options.add(StandardOpenOption.SYNC);
+            }
+            // Try to open the lock file
+            final FileChannel fd = FileChannel.open(Path.of(filename), options);
+            final FileChannel hintFD = openHintFile(Path.of(filename), options.toArray(new OpenOption[0]));
+            return new FileState(OpenMode.READ_WRITE, filename, fileTimestamp(filename), fd, 0, 0, hintFD);
+        } finally {
+            LockOperations.release(lock);
+        }
+    }
+
+    private static void ensureDir(String filename) throws IOException {
+        final Path fullPath = Paths.get(filename);
+        Files.createDirectories(fullPath.getParent());
+    }
+
+    private static String mkFilename(String dirname, long newest) {
+        return Paths.get(dirname, newest + ".bitcask.data").toString();
+    }
+
+    private static IO.BCFileLock getCreateLock(String dirname) throws IOException, InterruptedException {
+        for (int i = 100; i > 0; i--) {
+            Thread.sleep(100 - i);
+            try {
+                final IO.BCFileLock lock = LockOperations.acquire(LockOperations.LockType.CREATE, dirname);
+                return lock;
+            } catch (LockOperations.AlreadyLockedException e) {
+                return getCreateLock(dirname);
+            } catch (IOException e) {
+                throw new IOException(e);
+            }
+        }
+        return null;
     }
 
     /**
@@ -693,5 +770,91 @@ class FileOperations {
 
         b.put(key);
         return b.flip();
+    }
+
+    enum WriteResponse {FRESH, WRAP, OK}
+
+    public static WriteResponse checkWrite(FileState fileState, byte[] key, int valSize, long maxSize) {
+        if (fileState == null) {
+            // for the very first write, special-case
+            return WriteResponse.FRESH;
+        }
+        final int size = JBitCask.HEADER_SIZE + key.length + valSize;
+        if (fileState.ofs + size > maxSize) {
+            return WriteResponse.WRAP;
+        } else {
+            return WriteResponse.OK;
+        }
+    }
+
+    static class WriteResult {
+        final FileState fileState;
+        final long offset;
+        final int size;
+
+        public WriteResult(FileState fileState, long offset, int size) {
+            this.fileState = fileState;
+            this.offset = offset;
+            this.size = size;
+        }
+    }
+
+    /**
+     * Write a Key-named binary data field ("Value") to the Filestate.
+     * */
+    public static WriteResult write(FileState fileState, byte[] key, byte[] value, long timestamp) throws IOException {
+        if (fileState.mode == OpenMode.READONLY) {
+            throw new BitCaskError("read only");
+        }
+        if (key.length > JBitCask.MAXKEYSIZE) {
+            throw new IllegalArgumentException("key length " + key.length + " exceeded " + JBitCask.MAXKEYSIZE);
+        }
+        if (value.length > JBitCask.MAXVALSIZE) {
+            throw new IllegalArgumentException("value length " + value.length + " exceeded " + JBitCask.MAXVALSIZE);
+        }
+        final int fieldSize = JBitCask.TSTAMPFIELD + JBitCask.KEYSIZEFIELD + JBitCask.VALSIZEFIELD + key.length + value.length;
+        final ByteBuffer field = ByteBuffer.allocate(fieldSize);
+        field.putInt((int) timestamp).putInt(key.length).putInt(value.length).put(key).put(value).flip();
+        final CRC32 crcCalculator = new CRC32();
+        crcCalculator.update(field);
+        final long crc = crcCalculator.getValue();
+        field.rewind();
+        final int totalSize = JBitCask.CRCSIZEFIELD + fieldSize;
+        final ByteBuffer crcField = ByteBuffer.allocate(totalSize);
+        crcField.putInt((int)crc).put(field).flip();
+
+        //Store the full entry in the data file
+        fileState.fd.write(crcField, fileState.ofs);
+        final boolean tombstone = JBitCask.isTombstone(value);
+
+        final ByteBuffer hintEntry = hintfileEntry(key, (int) timestamp, tombstone ? 1 : 0, fileState.ofs, totalSize);
+        if (fileState.hintfd != null) {
+            fileState.hintfd.write(hintEntry);
+            hintEntry.flip();
+        }
+
+        // Record our final offset
+        crcCalculator.reset();
+        crcCalculator.update((int) fileState.hintcrc);
+        crcCalculator.update(hintEntry);
+        hintEntry.flip();
+        final int hintCRC = (int) crcCalculator.getValue(); // compute crc of hint
+        final FileState newState = new FileState(fileState.mode, fileState.filename, fileState.timestamp, fileState.fd,
+                fileState.ofs + totalSize, hintCRC, fileState.hintfd, fileState.ofs, hintEntry.remaining(), hintCRC);
+        return new WriteResult(newState, fileState.ofs, totalSize);
+    }
+
+    /**
+     * WARNING: We can only undo the last write.
+     * */
+    public static FileState unWrite(FileState fileState) throws IOException {
+        fileState.fd.truncate(fileState.lastOfs);
+        fileState.fd.position(0); // TODO why put the position to the start?
+        final long current = fileState.hintfd.position();
+        fileState.hintfd.truncate(current - fileState.lastHintBytes);
+
+        return new FileState(fileState.mode, fileState.filename, fileState.timestamp, fileState.fd, fileState.lastOfs,
+                fileState.lastHintCrc, fileState.hintfd, fileState.lastOfs, fileState.lastHintBytes,
+                fileState.lastHintCrc);
     }
 }
