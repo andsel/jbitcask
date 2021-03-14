@@ -27,4 +27,9 @@ class AlreadyExistsError extends BitCaskError {
 }
 
 class KeyNotFoundError extends BitCaskError {}
+
 class ReadOnlyError extends BitCaskError {}
+
+class NoFileError extends BitCaskError {}
+
+class BadCrcError extends BitCaskError {}

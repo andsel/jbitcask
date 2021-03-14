@@ -29,7 +29,7 @@ final class Keydir {
         int totalSize;
         long epoch;
         long offset;
-        long tstamp;
+        long tstamp; //seonds
         boolean isTombstone;
         byte[] key;
 
@@ -244,6 +244,9 @@ final class Keydir {
     // This is a conditional removal. We
     // only want to actually remove the entry if the tstamp, fileid and
     // offset matches the one provided. A sort of poor-man's CAS.
+    /**
+     * @throws AlreadyExistsError
+     * */
     public void keydirRemove(byte[] key, long timestamp, int fileId, long offset) {
         int removeTime = 0;
         mutex.lock();

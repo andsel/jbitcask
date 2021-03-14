@@ -4,6 +4,7 @@ import org.dna.jbitcask.FileOperations.FileState;
 import org.dna.jbitcask.FileOperations.KeyFoldMode;
 import org.dna.jbitcask.LockOperations.LockType;
 
+import java.io.EOFException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -12,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -105,6 +107,12 @@ public class JBitCask {
     private byte tombstoneVersion;
     private boolean readWriteP;
 
+    /**
+     * A bitcask is a directory containing:
+     * - One or more data files - {integer_timestamp}.bitcask.data
+     * - A write lock - bitcask.write.lock (Optional)
+     * - A merge lock - bitcask.merge.lock (Optional)
+     * */
     public static JBitCask open(String dirname) throws IOException, InterruptedException, TimeoutException {
         return open(dirname, new Options(new Properties()));
     }
@@ -614,5 +622,98 @@ public class JBitCask {
             case 2 -> TOMBSTONE2_SIZE;
             default -> throw new IllegalArgumentException("tombstone version must be 0 or 2, received: " + tombstoneVersion);
         };
+    }
+
+    /**
+     * Retrieve a value by key from a bitcask datastore.
+     * @throws KeyNotFoundError
+     * */
+    public byte[] get(byte[] key) throws IOException {
+        return get(key, 2);
+    }
+
+    private byte[] get(byte[] key, int trycount) throws IOException {
+        if (trycount == 0) {
+            throw new NoFileError();
+        }
+
+        final Keydir.EntryProxy entryProxy = this.state.keydir.get(key);
+        if (entryProxy.tstamp < expiryTime(state.opts)) {
+            // Expired entry; remove from keydir
+            try {
+                this.state.keydir.keydirRemove(key, entryProxy.tstamp, entryProxy.fileId, entryProxy.offset);
+                throw new KeyNotFoundError();
+            } catch (AlreadyExistsError e) {
+                // Updated since last read, try again.
+                return get(key, trycount - 1);
+            }
+        } else {
+            // HACK: Use a fully-qualified call to get_filestate/2 so that
+            // we can intercept calls w/ Pulse tests.
+            final FileState filestate;
+            try {
+                filestate = getFilestate(entryProxy.fileId, this.state);
+            } catch (FileNotFoundException e) {
+                // merging deleted file between keydir_get and here
+                return get(key, trycount - 1);
+            }
+            try {
+                final FileOperations.KeyValue keyValue = FileOperations.read(filestate, entryProxy.offset, entryProxy.totalSize);
+                if (isTombstone(keyValue.value)) {
+                    throw new KeyNotFoundError();
+                }
+                return keyValue.value;
+            } catch (EOFException eofex) {
+                throw new KeyNotFoundError();
+            }
+        }
+    }
+
+    // modify the state implace
+    private FileState getFilestate(int fileId, BitcaskState state) throws IOException {
+        return getFilestate(fileId, state.dirname, state.readFiles, FileOperations.OpenMode.READONLY);
+    }
+
+    // eventually modify readFiles, so it's an output param
+    private FileState getFilestate(int fileId, String dirname, List<FileState> readFiles, FileOperations.OpenMode openMode) throws IOException {
+        final FileState res = searchStateByTimestamp(fileId, readFiles);
+        if (res != null) {
+            return res;
+        }
+        final String filename = FileOperations.mkFilename(dirname, fileId);
+        final FileState fileState;
+        try {
+            fileState = FileOperations.openFile(Path.of(filename), openMode);
+        } catch (FileNotFoundException fnfex) {
+            // merge removed the file since the keydir_get
+            throw fnfex;
+        }
+
+        readFiles.addAll(0, Collections.singletonList(fileState));
+        return fileState;
+    }
+
+    private FileState searchStateByTimestamp(long timestamp, List<FileState> files) {
+        for (FileState fs : files) {
+            if (fs.getTimestamp() == timestamp) {
+                return fs;
+            }
+        }
+        return null;
+    }
+
+    private static int filestateTimestampCompare(FileState t1, FileState t2) {
+        return Long.compare(t1.getTimestamp(), t2.getTimestamp());
+    }
+
+    /**
+     * @return seconds
+     * */
+    private int expiryTime(Options opts) {
+        final int expirySecs = opts.get(Options.EXPIRY_SECS);
+        if (expirySecs <= 0) {
+            return 0;
+        }
+        return (int) (System.currentTimeMillis() / 1000) - expirySecs;
     }
 }

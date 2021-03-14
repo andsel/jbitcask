@@ -8,7 +8,6 @@ import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
@@ -19,7 +18,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -35,7 +33,7 @@ class FileOperations {
 
     /**
      * Use only after merging, to permanently delete a data file.
-     * */
+     */
     static void delete(Path file) {
         file.toFile().delete();
         if (hasHintFile(file)) {
@@ -123,7 +121,7 @@ class FileOperations {
     /**
      * Open a new file for writing.
      * Called on a Dirname, will open a fresh file in that directory.
-     * */
+     */
     static FileState createFile(String dirname, Options opts, Keydir keydir) throws IOException, InterruptedException {
         final IO.BCFileLock lock;
         try {
@@ -157,7 +155,7 @@ class FileOperations {
         Files.createDirectories(fullPath.getParent());
     }
 
-    private static String mkFilename(String dirname, long newest) {
+    static String mkFilename(String dirname, long newest) {
         return Paths.get(dirname, newest + ".bitcask.data").toString();
     }
 
@@ -186,7 +184,7 @@ class FileOperations {
 
     /**
      * throw BitCaskError if openMode is not valid (READONLY|APPEND)
-     * */
+     */
     static FileState openFile(Path filename, OpenMode openMode) throws IOException {
         if (openMode == OpenMode.READONLY) {
             return new FileState(OpenMode.READONLY, filename.getFileName().toString(), fileTimestamp(filename),
@@ -208,10 +206,10 @@ class FileOperations {
                         fd, offset, fileAndCRC.crc, fileAndCRC.file);
             } catch (FileNotFoundException | BitCaskError e) {
                 fd.close();
-                throw new FileNotFoundException("Error in opening " +  filename);
+                throw new FileNotFoundException("Error in opening " + filename);
             }
         }
-        throw new BitCaskError("openFile doesn't expect " +  openMode);
+        throw new BitCaskError("openFile doesn't expect " + openMode);
     }
 
     static class FileAndCRC {
@@ -228,7 +226,8 @@ class FileOperations {
      * Re-open hintfile for appending.
      * throws BitCaskError if file can't be open
      *
-     * @return*/
+     * @return
+     */
     private static FileAndCRC reopenHintfile(Path filename) throws IOException {
         final FileChannel hintFD = openHintFile(filename);
         final String hintfileName = hintfileName(filename.toString());
@@ -246,7 +245,7 @@ class FileOperations {
 
     /**
      * Removes the final CRC record so more records can be added to the file.
-     * */
+     */
     private static long prepareHintfileForAppend(FileChannel hintFD) throws IOException {
         try {
             final long crc = readCrc(hintFD);
@@ -260,7 +259,7 @@ class FileOperations {
 
     /**
      * throws BitCaskError if file can't be open
-     * */
+     */
     private static FileChannel openHintFile(Path filename, OpenOption... options) throws IOException {
         final String hintFilename = hintFilename(filename);
         for (int i = 0; i < 10; i++) {
@@ -279,38 +278,40 @@ class FileOperations {
     }
 
     static class TimeStampedFile implements Comparable<TimeStampedFile> {
-         private final long timestamp;
-         private final Path filename;
+        private final long timestamp;
+        private final Path filename;
 
-         public TimeStampedFile(long timestamp, Path filename) {
-             this.timestamp = timestamp;
-             this.filename = filename;
-         }
+        public TimeStampedFile(long timestamp, Path filename) {
+            this.timestamp = timestamp;
+            this.filename = filename;
+        }
 
-         @Override
-         public boolean equals(Object o) {
-             if (this == o) return true;
-             if (o == null || getClass() != o.getClass()) return false;
-             TimeStampedFile that = (TimeStampedFile) o;
-             return timestamp == that.timestamp && filename.equals(that.filename);
-         }
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            TimeStampedFile that = (TimeStampedFile) o;
+            return timestamp == that.timestamp && filename.equals(that.filename);
+        }
 
-         public Path getFilename() {
-             return filename;
-         }
+        public Path getFilename() {
+            return filename;
+        }
 
-         @Override
-         public int hashCode() {
-             return Objects.hash(timestamp, filename);
-         }
+        @Override
+        public int hashCode() {
+            return Objects.hash(timestamp, filename);
+        }
 
-         @Override
-         public int compareTo(TimeStampedFile o) {
-             return Long.compare(this.timestamp, o.timestamp);
-         }
-     }
+        @Override
+        public int compareTo(TimeStampedFile o) {
+            return Long.compare(this.timestamp, o.timestamp);
+        }
+    }
 
-    /** Build a list of {tstamp, filename} for all files in the directory that match our regex.*/
+    /**
+     * Build a list of {tstamp, filename} for all files in the directory that match our regex.
+     */
     static List<TimeStampedFile> dataFileTimestamps(String dirname) {
         //filename are in format <timestamp>.<something>.data
         final File dir = new File(dirname);
@@ -449,17 +450,17 @@ class FileOperations {
     }
 
     /**
-     *  Return true if there is a hintfile and it has
-     *  a valid CRC check
-     * */
+     * Return true if there is a hintfile and it has
+     * a valid CRC check
+     */
     static boolean hasValidHintfile() throws IOException {
         return hasValidHintfile();
     }
 
     /**
-     *  Return true if there is a hintfile and it has
-     *  a valid CRC check
-     * */
+     * Return true if there is a hintfile and it has
+     * a valid CRC check
+     */
     static boolean hasValidHintfile(FileState state) {
         final String hintFile = hintfileName(state);
         // TODO find how to ask for a READ_AHEAD in JVM
@@ -525,7 +526,7 @@ class FileOperations {
     }
 
     static <A> A foldKeys(FileState state, KeyFoldFunction<A> foldFun, A acc, KeyFoldMode mode,
-                           Object dontcare, boolean validHintFile) throws IOException {
+                          Object dontcare, boolean validHintFile) throws IOException {
         if (mode != KeyFoldMode.RECOVERY) {
             throw new IllegalArgumentException("mode MUST be RECOVERY");
         }
@@ -545,7 +546,7 @@ class FileOperations {
     }
 
     private static <A> BytesFoldFunResult<KeyData, A> foldKeysIntLoop(ByteBuffer data, KeyFoldFunction<A> fun, A acc, long consumed,
-                                          KeyData args) {
+                                                                      KeyData args) {
 //        String filename, long fTStamp, long offset, long crcSkipCount
         if (args.crcSkipCount == 20) {
             System.err.printf("fold_loop: CRC error limit at file %s offset %d%n", args.filename, args.offset);
@@ -603,7 +604,7 @@ class FileOperations {
     // binary
     // same signature of BytesFoldFunction
     private static <A> BytesFoldFunResult<HintfileData, A> foldHintfileLoop(ByteBuffer data, KeyFoldFunction<A> fun, A acc, long consumed,
-                                           HintfileData args) {
+                                                                            HintfileData args) {
         if (data.remaining() < JBitCask.TSTAMPFIELD + JBitCask.KEYSIZEFIELD + JBitCask.TOTALSIZEFIELD +
                 JBitCask.TOMBSTONEFIELD_V2 + JBitCask.OFFSETFIELD_V2) {
             //catchall case where we don't get enough bytes from fold_file_loop
@@ -717,7 +718,8 @@ class FileOperations {
     /**
      * Close a file for writing, but leave it open for reads.
      *
-     * @param fileState*/
+     * @param fileState
+     */
     public static FileState closeForWriting(FileState fileState) throws IOException {
         final FileState state = closeHintfile(fileState);
         fileState.fd.force(false);
@@ -727,7 +729,7 @@ class FileOperations {
 
     /**
      * Use when done writing a file.  (never open for writing again)
-     * */
+     */
     public static void close(FileState fileState) throws IOException {
         closeHintfile(fileState);
         fileState.fd.close();
@@ -735,7 +737,7 @@ class FileOperations {
 
     /**
      * Use when closing multiple files.  (never open for writing again)
-     * */
+     */
     public static void closeAll(List<FileState> fileStates) throws IOException {
         for (FileState state : fileStates) {
             close(state);
@@ -801,7 +803,7 @@ class FileOperations {
 
     /**
      * Write a Key-named binary data field ("Value") to the Filestate.
-     * */
+     */
     public static WriteResult write(FileState fileState, byte[] key, byte[] value, long timestamp) throws IOException {
         if (fileState.mode == OpenMode.READONLY) {
             throw new BitCaskError("read only");
@@ -821,7 +823,7 @@ class FileOperations {
         field.rewind();
         final int totalSize = JBitCask.CRCSIZEFIELD + fieldSize;
         final ByteBuffer crcField = ByteBuffer.allocate(totalSize);
-        crcField.putInt((int)crc).put(field).flip();
+        crcField.putInt((int) crc).put(field).flip();
 
         //Store the full entry in the data file
         fileState.fd.write(crcField, fileState.ofs);
@@ -846,7 +848,7 @@ class FileOperations {
 
     /**
      * WARNING: We can only undo the last write.
-     * */
+     */
     public static FileState unWrite(FileState fileState) throws IOException {
         fileState.fd.truncate(fileState.lastOfs);
         fileState.fd.position(0); // TODO why put the position to the start?
@@ -856,5 +858,46 @@ class FileOperations {
         return new FileState(fileState.mode, fileState.filename, fileState.timestamp, fileState.fd, fileState.lastOfs,
                 fileState.lastHintCrc, fileState.hintfd, fileState.lastOfs, fileState.lastHintBytes,
                 fileState.lastHintCrc);
+    }
+
+    static class KeyValue {
+        final byte[] key;
+        final byte[] value;
+
+        public KeyValue(byte[] key, byte[] value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
+    /**
+     * Given an Offset and Size, get the corresponding k/v from Filename.
+     */
+    public static KeyValue read(String filename, long offset, int size) throws IOException {
+        final FileState fileState = openFile(Path.of(filename));
+        return read(fileState, offset, size);
+    }
+
+    public static KeyValue read(FileState fileState, long offset, int size) throws IOException {
+        final ByteBuffer data = ByteBuffer.allocate(size);
+        fileState.fd.read(data, offset);
+        final int crc32 = data.getInt();
+        data.mark();
+        // Verify the CRC of the data
+        final CRC32 crcCodec = new CRC32();
+        crcCodec.update(data);
+        if (crc32 != crcCodec.getValue()) {
+            throw new BadCrcError();
+        }
+        // Unpack the actual data
+        data.reset();
+        final int timestamp = data.getInt();
+        final short keySize = data.getShort();
+        final int valueSize = data.getInt();
+        byte[] key = new byte[keySize];
+        byte[] value = new byte[valueSize];
+        data.get(key);
+        data.get(value);
+        return new KeyValue(key, value);
     }
 }
