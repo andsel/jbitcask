@@ -116,6 +116,10 @@ class FileOperations {
         public String getFilename() {
             return filename;
         }
+
+        public void close() throws IOException {
+            fd.close();
+        }
     }
 
     /**
@@ -404,7 +408,7 @@ class FileOperations {
 
     @FunctionalInterface
     public interface BytesFoldFunction<D, A> {
-        BytesFoldFunResult<D, A> fold(ByteBuffer bytes, KeyFoldFunction keyFoldFun, A acc, long totalSize, D args);
+        BytesFoldFunResult<D, A> fold(ByteBuffer bytes, KeyFoldFunction<A> keyFoldFun, A acc, long totalSize, D args);
     }
 
     static KeyFoldMode foldKeys(FileState state, KeyFoldFunction<KeyFoldMode> foldFunc, KeyFoldMode acc) {
@@ -545,9 +549,79 @@ class FileOperations {
                 acc, new KeyData(fs.filename, fs.timestamp, offset, 0));
     }
 
+    static class PosInfo {
+        private final String filename;
+        private final long fTStamp;
+        final long offset;
+        private final long totalSize;
+
+        public PosInfo(String filename, long fTStamp, long offset, long totalSize) {
+            this.filename = filename;
+            this.fTStamp = fTStamp;
+            this.offset = offset;
+            this.totalSize = totalSize;
+        }
+    }
+
+    @FunctionalInterface
+    public interface KeyValueFoldFunction<A> {
+        A fold(byte[] key, byte[] value, long timestamp, PosInfo pos, A acc) throws IOException, InterruptedException;
+    }
+
+    public static <A> A fold(FileState f, KeyValueFoldFunction<A> fun, A acc) throws IOException {
+        //TODO if f.isFresh() return acc
+        //TODO: Add some sort of check that this is a read-only file
+        f.fd.position(0L);
+        PosInfo posInfo = new PosInfo(f.filename, f.timestamp, 0, 0 );
+        return foldFileLoop(f.fd, FileType.REGULAR, FileOperations::foldIntLoop, fun, acc, posInfo);
+    }
+
+    private static <A> BytesFoldFunResult<KeyData, A> foldIntLoop(ByteBuffer data, KeyValueFoldFunction<A> fun, A acc,
+                                                                  long consumed, KeyData args) {
+        // L544
+        if (args.crcSkipCount == 20) {
+            System.err.printf("fold_loop: CRC error limit at file %s offset %d%n", args.filename, args.offset);
+            return new BytesFoldFunResult<KeyData, A>(BytesFoldFunResult.Type.DONE, acc);
+        }
+
+        try {
+            final int crc32 = data.getInt(); //CRCSIZEFIELD
+            final int sliceStart = data.position();
+            final int tstamp = data.getInt(); //TSTAMPFIELD
+            final int keySize = data.getShort(); //KEYSIZEFIELD
+            final int valueSize = data.getInt(); //VALSIZEFIELD
+
+            final byte[] key = new byte[keySize];
+            data.get(key);
+
+            final byte[] value = new byte[valueSize];
+            data.get(value);
+
+            final int totalSize = keySize + valueSize + JBitCask.HEADER_SIZE;
+            final CRC32 crcCodec = new CRC32();
+            crcCodec.update(data.slice(sliceStart, JBitCask.TSTAMPFIELD + JBitCask.KEYSIZEFIELD + JBitCask.VALSIZEFIELD));
+            crcCodec.update(key);
+            crcCodec.update(value);
+            final long calcCrc = crcCodec.getValue();
+
+            if (crc32 != calcCrc) {
+                System.err.printf("fold_loop: CRC error at file %s offset %d, skipping %d bytes%n", args.filename, args.offset, totalSize);
+                return foldIntLoop(data, fun, acc, consumed + totalSize,
+                        new KeyData(args.filename, args.fTStamp, args.offset + totalSize, args.crcSkipCount + 1));
+            }
+
+            PosInfo posInfo = new PosInfo(args.filename, args.fTStamp, args.offset, totalSize);
+            A accNew = fun.fold(key, value, tstamp, posInfo, acc);
+
+            return foldIntLoop(data, fun, accNew, consumed + totalSize, new KeyData(args.filename, args.fTStamp,
+                    args.offset + totalSize, args.crcSkipCount));
+        } catch (BufferUnderflowException | IOException | InterruptedException underflow) {
+            return new BytesFoldFunResult<>(BytesFoldFunResult.Type.MORE, acc, consumed, new KeyData(args.filename, args.fTStamp, args.offset, args.crcSkipCount));
+        }
+    }
+
     private static <A> BytesFoldFunResult<KeyData, A> foldKeysIntLoop(ByteBuffer data, KeyFoldFunction<A> fun, A acc, long consumed,
                                                                       KeyData args) {
-//        String filename, long fTStamp, long offset, long crcSkipCount
         if (args.crcSkipCount == 20) {
             System.err.printf("fold_loop: CRC error limit at file %s offset %d%n", args.filename, args.offset);
             return new BytesFoldFunResult<KeyData, A>(BytesFoldFunResult.Type.DONE, acc);
@@ -576,7 +650,7 @@ class FileOperations {
                 return foldKeysIntLoop(data, fun, acc, consumed + totalSize,
                         new KeyData(args.filename, args.fTStamp, args.offset + totalSize, args.crcSkipCount + 1));
             }
-            final boolean tombstone = JBitCask.isTombstone(data);
+            final boolean tombstone = JBitCask.isTombstone(value);
             A accNew = fun.fold(tombstone, key, tstamp, args.offset, totalSize, acc);
             return foldKeysIntLoop(data, fun, accNew, consumed + totalSize, new KeyData(args.filename, args.fTStamp,
                     args.offset + totalSize, args.crcSkipCount));

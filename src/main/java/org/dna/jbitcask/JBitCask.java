@@ -13,11 +13,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 
@@ -57,6 +60,69 @@ public class JBitCask {
             this.maxFileSize = other.maxFileSize;
             this.keydir = other.keydir;
             this.opts = other.opts;
+        }
+    }
+
+    private static class MergeState {
+        private final String dirname;
+        private final IO.BCFileLock mergeLock;
+        private final long maxFileSize;
+        private final List<FileState> inputFiles;
+        private final Set<Long> inputFileIds;
+        private final long minFileId;
+        private List<FileState> tombstoneWriteFiles = new ArrayList<>();
+        FileState outFile = null; //fresh // will be created when needed
+        private final MergeCoverage mergeCoverage;
+        private final Keydir liveKeydir;
+        private final Keydir delKeydir;
+        private final long expiryTime;
+        private final long expiryGraceTime;
+        private final Function<byte[], byte[]> keyTransformer;
+        private boolean readWriteP = false;
+        private final Options opts;
+        private List<FileState> deleteFiles = new ArrayList<>();
+
+        public MergeState(String dirname, IO.BCFileLock mergeLock, long maxFileSize, List<FileState> inputFiles,
+                          Set<Long> inputFileIds, long minFileId, MergeCoverage mergeCoverage, Keydir liveKeydir,
+                          Keydir delKeydir, long expiryTime, long expiryGraceTime,
+                          Function<byte[], byte[]> keyTransformer, Options opts) {
+            this.dirname = dirname;
+            this.mergeLock = mergeLock;
+            this.maxFileSize = maxFileSize;
+            this.inputFiles = inputFiles;
+            this.inputFileIds = inputFileIds;
+            this.minFileId = minFileId;
+            this.mergeCoverage = mergeCoverage;
+            this.liveKeydir = liveKeydir;
+            this.delKeydir = delKeydir;
+            this.expiryTime = expiryTime;
+            this.expiryGraceTime = expiryGraceTime;
+            this.keyTransformer = keyTransformer;
+            this.opts = opts;
+        }
+
+        MergeState copyWithDeleteFile(List<FileState> deleteFiles) {
+            final MergeState copiedState = new MergeState(this.dirname, this.mergeLock, this.maxFileSize,
+                    this.inputFiles, this.inputFileIds, this.minFileId, this.mergeCoverage,
+                    this.liveKeydir, this.delKeydir, this.expiryTime, this.expiryGraceTime,
+                    this.keyTransformer, this.opts);
+            copiedState.deleteFiles = deleteFiles;
+            copiedState.tombstoneWriteFiles = this.tombstoneWriteFiles;
+            copiedState.outFile = this.outFile;
+            copiedState.readWriteP = this.readWriteP;
+            return copiedState;
+        }
+
+        MergeState copyWithInputFiles(List<FileState> inputFiles) {
+            final MergeState newState = new MergeState(this.dirname, this.mergeLock, this.maxFileSize,
+                    inputFiles, this.inputFileIds, this.minFileId, this.mergeCoverage,
+                    this.liveKeydir, this.delKeydir, this.expiryTime, this.expiryGraceTime,
+                    this.keyTransformer, this.opts);
+            newState.tombstoneWriteFiles = tombstoneWriteFiles;
+            newState.outFile = outFile;
+            newState.readWriteP = readWriteP;
+            newState.deleteFiles = deleteFiles;
+            return newState;
         }
     }
 
@@ -320,6 +386,11 @@ public class JBitCask {
         mergingList.add(fileState);
         mergingList.addAll(acc);
         return scanKeyFiles(rest, keydir, mergingList, closeFile, keyTransformer);
+    }
+
+    private static List<Path> readableFiles(String dirname) {
+        final Map<Boolean, List<Path>> res = readableAndSetuidFiles(dirname);
+        return res.get(true);
     }
 
     private static Map<Boolean, List<Path>> readableAndSetuidFiles(String dirname) {
@@ -674,6 +745,11 @@ public class JBitCask {
         return getFilestate(fileId, state.dirname, state.readFiles, FileOperations.OpenMode.READONLY);
     }
 
+    // modify the state implace
+    private FileState getFilestate(int fileId, MergeState state) throws IOException {
+        return getFilestate(fileId, state.dirname, state.tombstoneWriteFiles, FileOperations.OpenMode.APPEND);
+    }
+
     // eventually modify readFiles, so it's an output param
     private FileState getFilestate(int fileId, String dirname, List<FileState> readFiles, FileOperations.OpenMode openMode) throws IOException {
         final FileState res = searchStateByTimestamp(fileId, readFiles);
@@ -715,5 +791,539 @@ public class JBitCask {
             return 0;
         }
         return (int) (System.currentTimeMillis() / 1000) - expirySecs;
+    }
+
+    /**
+     * Merge several data files within a bitcask datastore
+     * */
+    public void merge(String dirname) throws IOException {
+        merge(dirname, new Options(new Properties()));
+    }
+
+    private void merge(String dirname, Options options) throws IOException {
+        merge(dirname, options, readableFiles(dirname), new ArrayList<>());
+    }
+
+    private void merge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException {
+        if (filesToMerge.isEmpty()) {
+            return;
+        }
+        // Filter the files to merge and ensure that they all exist. It's
+        // possible in some circumstances that we'll get an out-of-date
+        // list of files.
+        final List<Path> filesToMerge0 = filesToMerge.stream().filter(f -> f.toFile().exists()).collect(Collectors.toList());
+        final List<Path> expiredFiles0 = expiredFiles.stream().filter(f -> f.toFile().exists()).collect(Collectors.toList());
+        doMerge(dirname, options, filesToMerge0, expiredFiles0);
+    }
+
+    enum MergeCoverage {
+        FULL, PREFIX, PARTIAL
+    }
+
+    // Inner merge function, assumes that all files exist.
+    private void doMerge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException {
+        if (filesToMerge.isEmpty() && expiredFiles.isEmpty()) {
+            return;
+        }
+        Function<byte[], byte[]> keyTransformer = getKeyTransform();
+
+        // Try to lock for merging
+        final IO.BCFileLock lock;
+        try {
+            lock = LockOperations.acquire(LockType.MERGE, dirname);
+        } catch (LockOperations.AlreadyLockedException e) {
+            throw new MergeLockedError();
+        }
+
+        // Get the live keydir
+        final Keydir liveKeyDir;
+        try {
+            liveKeyDir = Keydir.maybeKeydirNew(dirname);
+        } catch (NotReadyError notReadyErr) {
+            // Someone else is loading the keydir, or this cask isn't open.
+            // We'll bail here and try again later.
+            LockOperations.release(lock);
+            throw notReadyErr;
+        }
+
+        // Simplest case; a key dir is already available and
+        // loaded. Go ahead and open just the files we wish to
+        // merge
+        final List<FileState> inFiles0 = new ArrayList<>(filesToMerge.size());
+        for (Path f: filesToMerge) {
+            // Handle open errors gracefully.
+            try {
+                final FileState fileState = FileOperations.openFile(f);
+                inFiles0.add(fileState);
+            } catch (BitCaskError | IOException ex) {
+                // skip it
+            }
+        }
+        final BitcaskState newState = new BitcaskState(dirname, null, null, null, 0, options, liveKeyDir);
+        //TODO overwrite immediately the state?
+        this.state = newState;
+
+        List<FileState> inFiles2 = new ArrayList<>();
+        List<FileState> inExpiredFiles = new ArrayList<>();
+        for (FileState fs : inFiles0) {
+            if (expiredFiles.contains(Path.of(fs.getFilename()))) {
+                inExpiredFiles.add(fs);
+            } else {
+                inFiles2.add(fs);
+            }
+        }
+
+        // Test to see if this is a complete or partial merge
+        // We perform this test now because our efforts to open the input files
+        // in the inFiles list loop above may have had an open
+        // failure.  The open(2) shouldn't fail, except, of course, when it
+        // does, e.g. EMFILE, ENFILE, the OS decides EINTR because "reasons", ...
+        final List<Path> readableFiles = readableFiles(dirname);
+        readableFiles.removeAll(expiredFiles);
+        Collections.sort(readableFiles);
+
+        final List<Path> filesToMergeNew = inFiles2.stream()
+                .map(FileState::getFilename)
+                .map(Path::of)
+                .sorted()
+                .collect(Collectors.toList());
+
+        MergeCoverage mergeCoverage;
+        if (filesToMergeNew.containsAll(readableFiles) && readableFiles.containsAll(filesToMergeNew)) {
+            mergeCoverage = MergeCoverage.FULL;
+        } else if (isPrefix(filesToMergeNew, readableFiles)) {
+            mergeCoverage = MergeCoverage.PREFIX;
+        } else {
+            mergeCoverage = MergeCoverage.PARTIAL;
+        }
+
+        // This sort is very important. The merge expects to visit files in order
+        // to properly detect current values, and could resurrect old values if not.
+        List<FileState> inFiles = new ArrayList<>(inFiles2);
+        inFiles.sort(Comparator.comparingLong(FileState::getTimestamp));
+        final Set<Long> inFileIds = inFiles.stream()
+                .map(FileOperations::fileTimestamp)
+                .collect(Collectors.toSet());
+        final long minFileId = readableFiles.stream()
+                .map(FileOperations::fileTimestamp)
+                .min(Long::compare)
+                .orElse(1L);
+
+        // Initialize the other keydirs we need.
+        final Keydir delKeyDir = Keydir.keydirNew();
+
+        // Initialize our state for the merge
+        final MergeState state = new MergeState(dirname, lock, options.get(Options.MAX_FILE_SIZE), inFiles, inFileIds, minFileId, mergeCoverage,
+                liveKeyDir, delKeyDir, options.get(Options.EXPIRY_TIME), options.get(Options.EXPIRY_GRACE_TIME), keyTransformer, options);
+
+        // Finally, start the merge process
+        final List<FileState> expiredFilesFinished = expiryMerge(inExpiredFiles, liveKeyDir, keyTransformer, new ArrayList<>());
+        final MergeState state1 = mergeFiles(state);
+
+        // Make sure to close the final output file
+        // TODO handle fresh state (bitcask.erl L714)
+        state1.outFile.close();
+
+        for (FileState tfile : state1.tombstoneWriteFiles) {
+            tfile.close();
+        }
+
+        // Close the original input files, schedule them for deletion,
+        // close keydirs, and release our lock
+        final List<FileState> toClose = new ArrayList<>(state.inputFiles);
+        toClose.addAll(expiredFilesFinished);
+        for (FileState fs : toClose) {
+            fs.close();
+        }
+        final long iterGeneration = liveKeyDir.getIterGeneration();
+        final List<FileState> delFiles = new ArrayList<>(state1.deleteFiles);
+        delFiles.addAll(expiredFilesFinished);
+        final List<String> fileNames = delFiles.stream().map(FileState::getFilename).collect(Collectors.toList());
+        final List<Long> delIds = delFiles.stream().map(FileState::getTimestamp).collect(Collectors.toList());
+        for (Long delId : delIds) {
+            liveKeyDir.setPendingDelete(delId);
+        }
+        for (String fileName : fileNames) {
+            setPendingDeleteBit(Path.of(fileName));
+        }
+
+        deferDelete(dirname, iterGeneration, fileNames);
+
+        // Explicitly release our keydirs instead of waiting for GC
+        liveKeyDir.release();
+        delKeyDir.release();
+        LockOperations.release(lock);
+    }
+
+    private void deferDelete(String dirname, long iterGeneration, List<String> fileNames) {
+        // TODO maybe do it in a background thread
+    }
+
+    // Internal merge function for cache_merge functionality.
+    private List<FileState> expiryMerge(List<FileState> files, Keydir liveKeyDir, Function<byte[], byte[]> keyTransformer,
+                                        List<FileState> acc) {
+        if (files.isEmpty()) {
+            return acc;
+        }
+        final FileState file = files.remove(0);
+        final long fileId = FileOperations.fileTimestamp(file);
+
+        FileOperations.KeyFoldFunction<KeyFoldMode> foldFunc = new FileOperations.KeyFoldFunction<KeyFoldMode>() {
+            @Override
+            public KeyFoldMode fold(boolean tombstone, byte[] key, long timestamp, long offset, long totalSize, KeyFoldMode acc) {
+                if (tombstone) {
+                    return acc;
+                }
+                try {
+                    final byte[] kt = keyTransformer.apply(key);
+                    liveKeyDir.keydirRemove(kt, timestamp, (int) fileId, offset);
+                } catch (Exception ex) {
+                    LOG.error("Invalid key on merge {}", key, ex);
+                }
+                return acc;
+            }
+        };
+
+        try {
+            FileOperations.foldKeys(file, foldFunc, KeyFoldMode.DEFAULT);
+            LOG.info("All keys expired in: {} scheduling file for deletion", file.getFilename());
+            acc.add(file);
+        } catch (Exception ex) {
+            LOG.error("Error folding keys for {}", file.getFilename(), ex);
+        }
+        expiryMerge(files, liveKeyDir, keyTransformer, acc);
+        return files;
+    }
+
+    private MergeState mergeFiles(MergeState state) throws IOException {
+        if (state.inputFiles.isEmpty()) {
+            return state;
+        }
+        final FileState file = state.inputFiles.remove(0);
+        final List<FileState> rest = state.inputFiles;
+        final long fileId = FileOperations.fileTimestamp(file);
+
+        FileOperations.KeyValueFoldFunction<MergeState> foldFunc = new FileOperations.KeyValueFoldFunction<MergeState>() {
+
+            @Override
+            public MergeState fold(byte[] key0, byte[] value, long timestamp, FileOperations.PosInfo pos, MergeState state0) throws IOException, InterruptedException {
+                final byte[] key;
+                try {
+                    key = keyTransform.apply(key0);
+                } catch (BitCaskError err) {
+                    LOG.error("Invalid key on merge {}", key0, err);
+                    return state0;
+                }
+
+                return mergeSingleEntry(key, value, timestamp, fileId, pos, state0);
+            }
+        };
+
+        final MergeState state1 = FileOperations.fold(file, foldFunc, state);
+        MergeState state2;
+        try {
+            List<FileState> delFiles = new ArrayList<>(state1.deleteFiles);
+            delFiles.add(0, file);
+            state2 = state1.copyWithDeleteFile(delFiles);
+        } catch (Exception e) {
+            LOG.error("merge_files: skipping file {} in {}", file.getFilename(), state.dirname, e);
+            state2 = state;
+        }
+        return mergeFiles(state2.copyWithInputFiles(rest));
+    }
+
+    private MergeState mergeSingleEntry(byte[] key, byte[] value, long timestamp, long fileId,
+                                        FileOperations.PosInfo pos, MergeState state) throws IOException, InterruptedException {
+        try {
+            final boolean outOfDate = outOfDate(state, key, timestamp, fileId, pos, state.expiryTime, false,
+                    List.of(state.liveKeydir, state.delKeydir));
+            if (outOfDate) {
+                // Value in keydir is newer, so drop ... except! ...
+                // We aren't done yet: V might be a tombstone, which means
+                // that we might have to merge it forward.  The func below
+                // is safe (does nothing) if V is not really a tombstone.
+                return mergeSingleTombstone(key, value, timestamp, fileId, pos.offset, state);
+            } else {
+                // Either a current value or a tombstone with nothing in the keydir
+                // but an entry in the del keydir because we've seen another during
+                // this merge.
+                if (isTombstone(value)) {
+                    // We have seen a tombstone for this key before, but this
+                    // one is newer than that one.
+                    state.delKeydir.keydirPut(key, (int) fileId, 0, pos.offset, timestamp, System.currentTimeMillis(), false);
+                    if (state.mergeCoverage == MergeCoverage.PARTIAL) {
+                        return innerMergeWrite(key, value, timestamp, fileId, pos.offset, state);
+                    } else {
+                        // Full or prefix merge, safe to drop the tombstone
+                        return state;
+                    }
+                } else {
+                    state.delKeydir.keydirRemove(key);
+                    return innerMergeWrite(key, value, timestamp, fileId, pos.offset, state);
+                }
+            }
+        } catch (ExpiredError expired) {
+            // Note: we drop a tombstone if it expired. Under normal
+            // circumstances it's OK as any value older than that has expired
+            // too and you wouldn't see values coming back to life after a
+            // merge and reopen.  However with a clock going back in time,
+            // and badly timed quick merges you could end up seeing an old
+            // value after we drop a tombstone that has a lower timestamp
+            // than a value that was actually written before. Likely that other
+            // value would expire soon too, but...
+
+            // Remove only if this is the current entry in the keydir
+            state.liveKeydir.keydirRemove(key, timestamp, (int) fileId, pos.offset);
+            return state;
+        } catch (NotFoundError notFound) {
+            // First tombstone seen for this key during this merge
+            return mergeSingleTombstone(key, value, timestamp, fileId, pos.offset, state);
+        }
+    }
+
+    private MergeState mergeSingleTombstone(byte[] key, byte[] value, long timestamp, long fileId, long offset,
+                                            MergeState state) throws IOException, InterruptedException {
+        try {
+            final TombstoneResp res = tombstoneContext(value);
+            final int oldFileId = res.fileId;
+            switch(res.atom) {
+                case BEFORE:
+                    if (state.minFileId > oldFileId) {
+                        return state;
+                    } else {
+                        return innerMergeWrite(key, value, timestamp, fileId, offset, state);
+                    }
+                case AT:
+                    // Tombstone has info on deleted value
+                    if (state.inputFileIds.contains(oldFileId)) {
+                        // Merge will waste the original value too. Drop it.
+                        return state;
+                    }
+
+                    // Append to original file
+                    try {
+                        final FileState tfile = getFilestate(oldFileId, state);
+                        // Original file still around, append to it
+                        final FileOperations.WriteResult writeResult = FileOperations.write(tfile, key, value, timestamp);
+                        final FileState tfile2 = writeResult.fileState;
+                        final int tsize = writeResult.size;
+                        state.liveKeydir.updateFstats(oldFileId, timestamp, 0L, 0, 0, 0, tsize, false);
+                        // implace change
+                        final List<FileState> tfiles2 = state.tombstoneWriteFiles.stream().map(fs ->
+                        {
+                            if (fs.getFilename().equals(tfile.getFilename()))
+                                return tfile2;
+                            else
+                                return fs;
+                        }).collect(Collectors.toList());
+                        state.tombstoneWriteFiles = tfiles2;
+                        return state;
+                    } catch (FileNotFoundException fnfex) {
+                        // Original file is gone, safe to drop
+                        return state;
+                    }
+            }
+        } catch (UndefinedError undefined) {
+            // Version 1 tombstone, no info on deleted value
+            // Not in keydir and not already deleted.
+            // Remember we deleted this already during this merge.
+            state.delKeydir.keydirPut(key, (int) fileId, 0, offset, timestamp, System.currentTimeMillis(), true);
+            if (state.mergeCoverage == MergeCoverage.PREFIX) {
+                byte[] v2 = new byte[TOMBSTONE1_SIZE];
+                System.arraycopy(TOMBSTONE1_BIN, 0, v2, 0, TOMBSTONE1_BIN.length);
+                v2[TOMBSTONE1_BIN.length] = (byte) ((fileId & 0xFF000000) >> 24);
+                v2[TOMBSTONE1_BIN.length + 1] = (byte) ((fileId & 0x00FF0000) >> 16);
+                v2[TOMBSTONE1_BIN.length + 2] = (byte) ((fileId & 0x0000FF00) >> 8);
+                v2[TOMBSTONE1_BIN.length + 3] = (byte) (fileId & 0x000000FF);
+                // Merging only some files, forward tombstone
+                return innerMergeWrite(key, v2, timestamp, fileId, offset, state);
+            }
+            // Full or prefix merge, so safe to drop tombstone
+            return state;
+        } catch (NoTombstoneError noTombstone) {
+            // Regular value not currently in keydir, ignore
+            return state;
+        }
+
+        throw new RuntimeException("mergeSingleTombstone MUST never be here");
+    }
+
+    private MergeState innerMergeWrite(byte[] key, byte[] value, long timestamp, long oldFileId, long oldOffset,
+                                       MergeState state) throws IOException, InterruptedException {
+        // write a single item while inside the merge process
+
+        // See if it's time to rotate to the next file
+        // Close the current output file
+        // Start our next file and update state
+        // create the output file and take the lock.
+        MergeState state1 = switch (FileOperations.checkWrite(state.outFile, key, value.length, state.maxFileSize)) {
+            case WRAP -> {
+                state.outFile.close();
+                final FileState newFile = FileOperations.createFile(state.dirname, state.opts, state.liveKeydir);
+                final String newFileName = newFile.getFilename();
+                LockOperations.writeActivefile(state.mergeLock, newFileName);
+                state.outFile = newFile;
+                yield state;
+            }
+            case OK -> state;
+            case FRESH -> {
+                final FileState newFile = FileOperations.createFile(state.dirname, state.opts, state.liveKeydir);
+                final String newFileName = newFile.getFilename();
+                LockOperations.writeActivefile(state.mergeLock, newFileName);
+                state.outFile = newFile;
+                yield state;
+            }
+        };
+        final FileOperations.WriteResult writeRes = FileOperations.write(state.outFile, key, value, timestamp);
+        final long outFileId = FileOperations.fileTimestamp(writeRes.fileState);
+        if (outFileId <= oldFileId) {
+            throw new InvariantViolationError(key, value, oldFileId, oldOffset, outFileId, writeRes.offset);
+        }
+
+        FileState outFile2;
+        if (!isTombstone(value)) {
+            // Update live keydir for the current out
+            // file. It's possible that someone else may have written
+            // a newer value whilst we were processing ... and if
+            // they did, we need to undo our write here.
+            try {
+                state1.liveKeydir.keydirPut(key, (int) outFileId, writeRes.size, writeRes.offset, timestamp,
+                        System.currentTimeMillis(), false, (int) oldFileId, (int) oldOffset);
+                outFile2 = writeRes.fileState;
+            } catch (AlreadyExistsError alreadyExists) {
+                outFile2 = FileOperations.unWrite(writeRes.fileState);
+            }
+        } else {
+            try {
+                final Keydir.EntryProxy entry = state1.liveKeydir.get(key);
+                // New value written, undo
+                outFile2 = FileOperations.unWrite(writeRes.fileState);
+            } catch (KeyNotFoundError notFound) {
+                // Update timestamp and total bytes stats
+                state1.liveKeydir.updateFstats((int) outFileId, timestamp, 0,0, 0, 0, writeRes.size, true);
+                // Still not there, tombstone write is cool
+                outFile2 = writeRes.fileState;
+            }
+
+        }
+        state1.outFile = outFile2;
+        return state1;
+    }
+
+    enum TombstoneAtom {BEFORE, AT}
+
+    final static class TombstoneResp {
+        final TombstoneAtom atom;
+        final int fileId;
+
+        TombstoneResp(TombstoneAtom atom, int fileId) {
+            this.atom = atom;
+            this.fileId = fileId;
+        }
+    }
+
+    private TombstoneResp tombstoneContext(byte[] value) {
+        if (Arrays.equals(TOMBSTONE0_STR.getBytes(), value)) {
+            throw new UndefinedError();
+        }
+        if (value.length != TOMBSTONE1_SIZE) {
+            throw new NoTombstoneError();
+        }
+        byte[] tombArray = new byte[TOMBSTONE1_BIN.length];
+        System.arraycopy(value, 0, tombArray, 0, TOMBSTONE1_BIN.length);
+        byte[] filedIdArray = new byte[4]; // 32 bit
+        System.arraycopy(value, TOMBSTONE1_BIN.length, filedIdArray, 0, 4);
+        int fileId = filedIdArray[0] & filedIdArray[1] << 8 & filedIdArray[2] << 16 & filedIdArray[3] << 24;
+        if (Arrays.equals(tombArray, TOMBSTONE1_BIN)) {
+            return new TombstoneResp(TombstoneAtom.BEFORE, fileId);
+        }
+        if (Arrays.equals(tombArray, TOMBSTONE2_BIN)) {
+            return new TombstoneResp(TombstoneAtom.AT, fileId);
+        }
+        throw new NoTombstoneError();
+    }
+
+    /**
+     * @throws NotFoundError when keydirs is empty and everFound is false.
+     * @throws ExpiredError when timestamp is older than expiryTime.
+     * */
+    private boolean outOfDate(MergeState state, byte[] key, long timestamp, long fileId, FileOperations.PosInfo pos,
+                              long expiryTime, boolean everFound, List<Keydir> keydirs) {
+        if (keydirs.isEmpty()) {
+            // if we ever found it, and none of the entries were out of date,
+            // then it's not out of date
+            if (everFound) {
+                return false;
+            } else {
+                throw new NotFoundError();
+            }
+        }
+        if (timestamp < expiryTime) {
+            throw new ExpiredError();
+        }
+
+        final Keydir keydir = keydirs.remove(0);
+        final Keydir.EntryProxy bitcaskEntry;
+        try {
+            bitcaskEntry = keydir.get(key);
+        } catch (NotFoundError notFound) {
+            return outOfDate(state, key, timestamp, fileId, pos, expiryTime, everFound, keydirs);
+        }
+
+        if (bitcaskEntry.tstamp == timestamp) {
+            // Exact match. In this situation, we use the file
+            // id and offset as a tie breaker.
+            // The assumption is that newer values are written to
+            // higher file ids and offsets, even in the case of a merge
+            // racing with the write process, as the writer thread
+            // will detect that and retry the write to an even higher
+            // file id.
+            if (bitcaskEntry.fileId > fileId) {
+                return true;
+            }
+            if (bitcaskEntry.fileId == fileId) {
+                if (bitcaskEntry.offset > pos.offset) {
+                    return true;
+                } else {
+                    return outOfDate(state, key, timestamp, fileId, pos, expiryTime, true, keydirs);
+                }
+            } else {
+                // At this point the following conditions are true:
+                // The file_id in the keydir is older (<) the file
+                // id we're currently merging...
+                //
+                // OR:
+                //
+                // The file_id in the keydir is the same (==) as the
+                // file we're merging BUT the offset the keydir has
+                // is older (<=) the offset we are currently
+                // processing.
+                //
+                // Thus, we are NOT out of date. Check the
+                // rest of the keydirs to ensure this
+                // holds true.
+                return outOfDate(state, key, timestamp, fileId, pos, expiryTime, true, keydirs);
+            }
+        } else if (bitcaskEntry.tstamp < timestamp) {
+            // Not out of date -- check rest of the keydirs
+            return outOfDate(state, key, timestamp, fileId, pos, expiryTime, true, keydirs);
+        } else {
+            // Out of date!
+            return true;
+        }
+    }
+
+
+    private boolean isPrefix(List<Path> prefix, List<Path> target) {
+        if (target.size() < prefix.size()) {
+            return false;
+        }
+        int size = prefix.size();
+        for (int i = 0; i < size; i++) {
+            if (!prefix.get(i).equals(target.get(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 }

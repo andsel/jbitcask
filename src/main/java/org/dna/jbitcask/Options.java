@@ -45,6 +45,8 @@ public final class Options {
     public static final Option<Boolean> READ_WRITE = new Option<>("read_write", Boolean.class, false, Boolean::getBoolean);
     public static final Option<Boolean> SYNC_STRATEGY = new Option<>("sync_strategy", Boolean.class, false, Boolean::getBoolean);
     public static final Option<Integer> EXPIRY_SECS = new Option<>("expiry_secs", Integer.class, 0, Integer::parseInt);
+    public static final Option<Long> EXPIRY_TIME = new Option<>("expiry_time", Long.class, 0L, Long::parseLong);
+    public static final Option<Long> EXPIRY_GRACE_TIME = new Option<>("expiry_grace_time", Long.class, 0L, Long::parseLong);
     public static final Option<Long> MAX_FILE_SIZE = new Option<>("max_file_size", Long.class, 0L, Long::parseLong);
     public static final Option<Long> OPEN_TIMEOUT = new Option<>("open_timeout", Long.class, 0L, Long::parseLong);
     public static final Option<Byte> TOMBSTONE_VERSION = new Option<>("tombstone_version", Byte.class, (byte)0, Byte::parseByte);

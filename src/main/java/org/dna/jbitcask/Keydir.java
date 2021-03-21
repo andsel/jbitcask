@@ -144,6 +144,10 @@ final class Keydir {
 
     final static BitcaskPrivData PRIV = new BitcaskPrivData();
 
+    private Keydir() {
+        this.name = "merge delete keydir";
+    }
+
     private Keydir(String dirname) {
         this.name = dirname;
     }
@@ -549,11 +553,17 @@ final class Keydir {
         return ret;
     }
 
+    /**
+     * @throws AlreadyExistsError
+     * */
     public void keydirPut(byte[] key, int fileId, int totalSize, long offset, long timestamp, long nowSeconds,
                           boolean newestPut) {
         keydirPut(key, fileId, totalSize, offset, timestamp, nowSeconds, newestPut, null, null);
     }
 
+    /**
+     * @throws AlreadyExistsError
+     * */
     public void keydirPut(byte[] key, int fileId, int totalSize, long offset, long timestamp, long nowSeconds,
                           boolean newestPut, Integer oldFileId, Integer oldOffset) throws AlreadyExistsError {
         if (oldFileId != null && oldOffset == null) {
@@ -737,10 +747,16 @@ final class Keydir {
         }
     }
 
+    /**
+     * @throws KeyNotFoundError
+     * */
     public EntryProxy get(byte[] key) throws KeyNotFoundError {
         return get(key, 0xffff_ffff_ffff_ffffL);
     }
 
+    /**
+     * @throws KeyNotFoundError
+     * */
     public EntryProxy get(byte[] key, long epoch) throws KeyNotFoundError {
         mutex.lock();
         perhapsSweepSiblings();
@@ -755,6 +771,71 @@ final class Keydir {
             mutex.unlock();
             throw new KeyNotFoundError();
         }
+    }
+
+    /**
+     * @throws NotReadyError
+     * */
+    static Keydir maybeKeydirNew(String dirname) {
+        Keydir.PRIV.globalKeydirsLock.lock();
+        final Keydir keydir = Keydir.PRIV.globalKeydirs.get(dirname);
+        Keydir.PRIV.globalKeydirsLock.unlock();
+        if (keydir == null) {
+            throw new NotReadyError();
+        }
+
+        return keydirNew(dirname);
+    }
+
+    static Keydir keydirNew() {
+        return new Keydir();
+    }
+
+    static Keydir keydirNew(String dirname) {
+        // Get our private stash and check the global hash table for this entry
+        Keydir.PRIV.globalKeydirsLock.lock();
+        Keydir keydir = Keydir.PRIV.globalKeydirs.get(dirname);
+        if (keydir != null) {
+            // Existing keydir is available. Check the is_ready flag to determine if
+            // the original creator is ready for other processes to use it.
+            if (!keydir.isReady()) {
+                // Notify the caller that while the requested keydir exists, it's not
+                // ready for public usage.
+                Keydir.PRIV.globalKeydirsLock.unlock();
+                throw new NotReadyError();
+            } else {
+                keydir.incRefCount();
+            }
+        } else {
+            // No such keydir, create a new one and add to the globals list.
+            keydir = new Keydir(dirname);
+            keydir.mutex = new ReentrantLock();
+
+            // Finally, register this new keydir in the globals
+            Keydir.PRIV.globalKeydirs.put(dirname, keydir);
+
+            final Integer oldBiggestFileId = Keydir.PRIV.globalBiggestFileId.get(dirname);
+            if (oldBiggestFileId != null) {
+                keydir.biggestFileId = oldBiggestFileId;
+            }
+        }
+        Keydir.PRIV.globalKeydirsLock.unlock();
+
+        if (!keydir.isReady()) {
+            throw new NotReadyError();
+        }
+
+        return keydir;
+    }
+
+    public long getIterGeneration() {
+        return iterGeneration;
+    }
+
+    public void setPendingDelete(long fileId) {
+        mutex.lock();
+        updateFstats((int) fileId, 0, epoch, 0, 0, 0, 0, false);
+        mutex.unlock();
     }
 }
 
