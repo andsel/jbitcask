@@ -245,14 +245,14 @@ public class JBitCask {
         // Get the named keydir for this directory. If we get it and it's already
         // marked as ready, that indicates another caller has already loaded
         // all the data from disk and we can short-circuit scanning all the files.
-        final FunctionResult<FunctionResult.Atom, Object> result = Keydir.create(dirname);
+        final FunctionResult<FunctionResult.Atom, Keydir> result = Keydir.create(dirname);
         if (result.getAtom() == FunctionResult.Atom.READY) {
             // A keydir already exists, nothing more to do here. We'll lazy
             // open files as needed.
-            return (Keydir) result.getResult();
-        } else if (result.getAtom() == FunctionResult.Atom.NOT_READY) {
-            if (result.getResult() instanceof Keydir) {
-                final Keydir keydir = (Keydir) result.getResult();
+            return result.getResult();
+        } else {
+            if (result.getResult() != null) {
+                final Keydir keydir = result.getResult();
                 // We've just created a new named keydir, so we need to load up all
                 // the data from disk. Build a list of all the bitcask data files
                 // and sort it in ascending order (oldest->newest).
@@ -295,9 +295,6 @@ public class JBitCask {
                 }
                 return initKeydir(dirname, waitTimeSecs - 100, readWriteMode, keyTransformer);
             }
-        } else {
-            // error never happen
-            throw new IllegalArgumentException("This CAN'T never happen");
         }
     }
 

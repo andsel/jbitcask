@@ -1,7 +1,7 @@
 package org.dna.jbitcask;
 
 final class FunctionResult<A, R> {
-    enum Atom {OK, ERROR, READY, NOT_READY}
+    enum Atom {READY, NOT_READY}
 
     private final A atom;
 

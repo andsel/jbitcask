@@ -170,7 +170,7 @@ final class Keydir {
         mutex.unlock();
     }
 
-    static FunctionResult<Atom, Object> create(String dirname) {
+    static FunctionResult<Atom, Keydir> create(String dirname) {
         // Get our private stash and check the global hash table for this entry
         PRIV.globalKeydirsLock.lock();
         Keydir keydir = PRIV.globalKeydirs.get(dirname);
@@ -181,7 +181,7 @@ final class Keydir {
                 // Notify the caller that while the requested keydir exists, it's not
                 // ready for public usage.
                 PRIV.globalKeydirsLock.unlock();
-                return new FunctionResult<>(Atom.ERROR, Atom.NOT_READY);
+                return new FunctionResult<>(Atom.NOT_READY, null);
             } else {
                 keydir.incRefCount();
             }
