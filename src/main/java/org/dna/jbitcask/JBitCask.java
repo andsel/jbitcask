@@ -1329,4 +1329,12 @@ public class JBitCask {
         }
         return true;
     }
+
+    /**
+     * Delete a key from a bitcask datastore.
+     * */
+    public void delete(byte[] key) throws InterruptedException, IOException, LockOperations.AlreadyLockedException {
+        put(key, TOMBSTONE2_BIN);
+    }
+
 }
