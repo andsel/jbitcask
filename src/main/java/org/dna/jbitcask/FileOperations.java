@@ -373,9 +373,29 @@ class FileOperations {
         DATAFILE, HINTFILE, DEFAULT, RECOVERY;
     }
 
+    static class KeyRecord {
+        final boolean isTombstone;
+        final byte[] key;
+
+        public KeyRecord(boolean isTombstone, byte[] key) {
+            this.isTombstone = isTombstone;
+            this.key = key;
+        }
+    }
+
+    static class KeyValueRecord {
+        final byte[] key;
+        final byte[] value;
+
+        public KeyValueRecord(byte[] key, byte[] value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
     @FunctionalInterface
-    public interface KeyFoldFunction<A> {
-        A fold(boolean tombstone, byte[] key, long timestamp, long offset, long totalSize, A acc);
+    public interface RecordFoldFunction<A, R> {
+        A fold(R record, long timestamp, PosInfo pos, A acc) throws IOException, InterruptedException;
     }
 
     static class BytesFoldFunResult<D, A> {
@@ -407,16 +427,16 @@ class FileOperations {
     }
 
     @FunctionalInterface
-    public interface BytesFoldFunction<D, A> {
-        BytesFoldFunResult<D, A> fold(ByteBuffer bytes, KeyFoldFunction<A> keyFoldFun, A acc, long totalSize, D args);
+    public interface BytesFoldFunction<D, A, R> {
+        BytesFoldFunResult<D, A> fold(ByteBuffer bytes, RecordFoldFunction<A, R> keyFoldFun, A acc, long totalSize, D args) throws IOException, InterruptedException;
     }
 
-    static KeyFoldMode foldKeys(FileState state, KeyFoldFunction<KeyFoldMode> foldFunc, KeyFoldMode acc) {
+    static KeyFoldMode foldKeys(FileState state, RecordFoldFunction<KeyFoldMode, KeyRecord> foldFunc, KeyFoldMode acc) {
         // TODO if state == :fresh return acc
         return foldKeys(state, foldFunc, KeyFoldMode.DEFAULT);
     }
 
-    static <A> A foldKeys(FileState state, KeyFoldFunction<A> foldFunc, A acc, KeyFoldMode mode) throws IOException {
+    static <A> A foldKeys(FileState state, RecordFoldFunction<A, KeyRecord> foldFunc, A acc, KeyFoldMode mode) throws IOException, InterruptedException {
         if (mode == KeyFoldMode.DATAFILE) {
             return foldKeysLoop(state, 0, foldFunc, acc);
         }
@@ -435,7 +455,7 @@ class FileOperations {
         return f.isFile() || f.isDirectory();
     }
 
-    static <A> A foldKeys(FileState state, KeyFoldFunction<A> foldFunc, A acc, KeyFoldMode mode, boolean hasHintfile) throws IOException {
+    static <A> A foldKeys(FileState state, RecordFoldFunction<A, KeyRecord> foldFunc, A acc, KeyFoldMode mode, boolean hasHintfile) throws IOException, InterruptedException {
         if (mode == KeyFoldMode.DEFAULT) {
             if (hasHintfile) {
                 return foldHintfile(state, foldFunc, acc);
@@ -451,14 +471,6 @@ class FileOperations {
             }
         }
         throw new BitCaskError("foldKeys case unreachable");
-    }
-
-    /**
-     * Return true if there is a hintfile and it has
-     * a valid CRC check
-     */
-    static boolean hasValidHintfile() throws IOException {
-        return hasValidHintfile();
     }
 
     /**
@@ -529,8 +541,8 @@ class FileOperations {
         throw new IOException("Bad CRC retrieval");
     }
 
-    static <A> A foldKeys(FileState state, KeyFoldFunction<A> foldFun, A acc, KeyFoldMode mode,
-                          Object dontcare, boolean validHintFile) throws IOException {
+    static <A> A foldKeys(FileState state, RecordFoldFunction<A, KeyRecord> foldFun, A acc, KeyFoldMode mode,
+                          Object dontcare, boolean validHintFile) throws IOException, InterruptedException {
         if (mode != KeyFoldMode.RECOVERY) {
             throw new IllegalArgumentException("mode MUST be RECOVERY");
         }
@@ -543,32 +555,31 @@ class FileOperations {
         }
     }
 
-    private static <A> A foldKeysLoop(FileState fs, long offset, KeyFoldFunction<A> fun, A acc) throws IOException {
+    private static <A> A foldKeysLoop(FileState fs, long offset, RecordFoldFunction<A, KeyRecord> fun, A acc) throws IOException, InterruptedException {
         fs.fd.position(offset);
-        return (A) foldFileLoop(fs.fd, FileType.REGULAR, FileOperations::foldKeysIntLoop, fun,
+        return foldFileLoop(fs.fd, FileType.REGULAR, FileOperations::foldKeysIntLoop, fun,
                 acc, new KeyData(fs.filename, fs.timestamp, offset, 0));
     }
 
     static class PosInfo {
         private final String filename;
-        private final long fTStamp;
+        private final Long fTStamp;
         final long offset;
-        private final long totalSize;
+        final long totalSize;
 
-        public PosInfo(String filename, long fTStamp, long offset, long totalSize) {
+        public PosInfo(String filename, Long fTStamp, long offset, long totalSize) {
             this.filename = filename;
             this.fTStamp = fTStamp;
             this.offset = offset;
             this.totalSize = totalSize;
         }
+
+        public PosInfo(long offset, int totalSize) {
+            this(null, null, offset, totalSize);
+        }
     }
 
-    @FunctionalInterface
-    public interface KeyValueFoldFunction<A> {
-        A fold(byte[] key, byte[] value, long timestamp, PosInfo pos, A acc) throws IOException, InterruptedException;
-    }
-
-    public static <A> A fold(FileState f, KeyValueFoldFunction<A> fun, A acc) throws IOException {
+    public static <A> A fold(FileState f, RecordFoldFunction<A, KeyValueRecord> fun, A acc) throws IOException, InterruptedException {
         //TODO if f.isFresh() return acc
         //TODO: Add some sort of check that this is a read-only file
         f.fd.position(0L);
@@ -576,12 +587,12 @@ class FileOperations {
         return foldFileLoop(f.fd, FileType.REGULAR, FileOperations::foldIntLoop, fun, acc, posInfo);
     }
 
-    private static <A> BytesFoldFunResult<KeyData, A> foldIntLoop(ByteBuffer data, KeyValueFoldFunction<A> fun, A acc,
-                                                                  long consumed, KeyData args) {
+    private static <A> BytesFoldFunResult<PosInfo, A> foldIntLoop(ByteBuffer data, RecordFoldFunction<A, KeyValueRecord> fun, A acc,
+                                                                  long consumed, PosInfo args) throws IOException, InterruptedException {
         // L544
-        if (args.crcSkipCount == 20) {
+        if (args.totalSize == 20) {
             System.err.printf("fold_loop: CRC error limit at file %s offset %d%n", args.filename, args.offset);
-            return new BytesFoldFunResult<KeyData, A>(BytesFoldFunResult.Type.DONE, acc);
+            return new BytesFoldFunResult<>(BytesFoldFunResult.Type.DONE, acc);
         }
 
         try {
@@ -607,24 +618,24 @@ class FileOperations {
             if (crc32 != calcCrc) {
                 System.err.printf("fold_loop: CRC error at file %s offset %d, skipping %d bytes%n", args.filename, args.offset, totalSize);
                 return foldIntLoop(data, fun, acc, consumed + totalSize,
-                        new KeyData(args.filename, args.fTStamp, args.offset + totalSize, args.crcSkipCount + 1));
+                        new PosInfo(args.filename, args.fTStamp, args.offset + totalSize, args.totalSize + 1));
             }
 
             PosInfo posInfo = new PosInfo(args.filename, args.fTStamp, args.offset, totalSize);
-            A accNew = fun.fold(key, value, tstamp, posInfo, acc);
+            A accNew = fun.fold(new KeyValueRecord(key, value), tstamp, posInfo, acc);
 
-            return foldIntLoop(data, fun, accNew, consumed + totalSize, new KeyData(args.filename, args.fTStamp,
-                    args.offset + totalSize, args.crcSkipCount));
-        } catch (BufferUnderflowException | IOException | InterruptedException underflow) {
-            return new BytesFoldFunResult<>(BytesFoldFunResult.Type.MORE, acc, consumed, new KeyData(args.filename, args.fTStamp, args.offset, args.crcSkipCount));
+            return foldIntLoop(data, fun, accNew, consumed + totalSize, new PosInfo(args.filename, args.fTStamp,
+                    args.offset + totalSize, args.totalSize));
+        } catch (BufferUnderflowException underflow) {
+            return new BytesFoldFunResult<>(BytesFoldFunResult.Type.MORE, acc, consumed, new PosInfo(args.filename, args.fTStamp, args.offset, args.totalSize));
         }
     }
 
-    private static <A> BytesFoldFunResult<KeyData, A> foldKeysIntLoop(ByteBuffer data, KeyFoldFunction<A> fun, A acc, long consumed,
-                                                                      KeyData args) {
+    private static <A> BytesFoldFunResult<KeyData, A> foldKeysIntLoop(ByteBuffer data, RecordFoldFunction<A, KeyRecord> fun, A acc, long consumed,
+                                                                      KeyData args) throws IOException, InterruptedException {
         if (args.crcSkipCount == 20) {
             System.err.printf("fold_loop: CRC error limit at file %s offset %d%n", args.filename, args.offset);
-            return new BytesFoldFunResult<KeyData, A>(BytesFoldFunResult.Type.DONE, acc);
+            return new BytesFoldFunResult<>(BytesFoldFunResult.Type.DONE, acc);
         }
         try {
             final int crc32 = data.getInt(); //CRCSIZEFIELD
@@ -651,7 +662,7 @@ class FileOperations {
                         new KeyData(args.filename, args.fTStamp, args.offset + totalSize, args.crcSkipCount + 1));
             }
             final boolean tombstone = JBitCask.isTombstone(value);
-            A accNew = fun.fold(tombstone, key, tstamp, args.offset, totalSize, acc);
+            A accNew = fun.fold(new KeyRecord(tombstone, key), tstamp, new PosInfo(args.offset, totalSize), acc);
             return foldKeysIntLoop(data, fun, accNew, consumed + totalSize, new KeyData(args.filename, args.fTStamp,
                     args.offset + totalSize, args.crcSkipCount));
         } catch (BufferUnderflowException underflow) {
@@ -661,13 +672,13 @@ class FileOperations {
 
     enum FileType {HINT, REGULAR}
 
-    private static <A> A foldHintfile(FileState state, KeyFoldFunction<A> foldFun, A acc) throws IOException {
+    private static <A> A foldHintfile(FileState state, RecordFoldFunction<A, KeyRecord> foldFun, A acc) throws IOException, InterruptedException {
         final String hintFile = hintfileName(state);
         // TODO find how to ask for a READ_AHEAD in JVM
         final FileChannel hintFD = IO.fileOpen(hintFile, Collections.singletonList(OpenMode.READONLY));
         try {
             final long dataSize = hintFD.size();
-            return (A) foldFileLoop(hintFD, FileType.HINT, FileOperations::foldHintfileLoop, foldFun, acc, new HintfileData(dataSize, hintFile));
+            return foldFileLoop(hintFD, FileType.HINT, FileOperations::foldHintfileLoop, foldFun, acc, new HintfileData(dataSize, hintFile));
         } finally {
             hintFD.close();
         }
@@ -677,8 +688,8 @@ class FileOperations {
     // if it gets a match, it proceeds to recurse over the rest of the big
     // binary
     // same signature of BytesFoldFunction
-    private static <A> BytesFoldFunResult<HintfileData, A> foldHintfileLoop(ByteBuffer data, KeyFoldFunction<A> fun, A acc, long consumed,
-                                                                            HintfileData args) {
+    private static <A> BytesFoldFunResult<HintfileData, A> foldHintfileLoop(ByteBuffer data, RecordFoldFunction<A, KeyRecord> fun, A acc, long consumed,
+                                                                            HintfileData args) throws IOException, InterruptedException {
         if (data.remaining() < JBitCask.TSTAMPFIELD + JBitCask.KEYSIZEFIELD + JBitCask.TOTALSIZEFIELD +
                 JBitCask.TOMBSTONEFIELD_V2 + JBitCask.OFFSETFIELD_V2) {
             //catchall case where we don't get enough bytes from fold_file_loop
@@ -706,19 +717,19 @@ class FileOperations {
                     args.hintFile, offset, totalSize, args.dataSize);
             throw new BitCaskError("trunc_hintfile");
         }
-        A accNew = fun.fold(tombInt > 0, key, tstamp, offset, totalSize, acc);
+        A accNew = fun.fold(new KeyRecord(tombInt > 0, key), tstamp, new PosInfo(offset, totalSize), acc);
         long consumedNew = keySize + HINT_RECORD_SZ + consumed;
         return foldHintfileLoop(data, fun, accNew, consumedNew, args);
     }
 
-    private static <T, A> A foldFileLoop(FileChannel fd, FileType type, BytesFoldFunction<T, A> foldFun,
-                                         KeyFoldFunction<A> intFoldFn, A acc, T args) throws IOException {
+    private static <T, A, R> A foldFileLoop(FileChannel fd, FileType type, BytesFoldFunction<T, A, R> foldFun,
+                                            RecordFoldFunction<A, R> intFoldFn, A acc, T args) throws IOException, InterruptedException {
         return foldFileLoop(fd, type, foldFun, intFoldFn, acc, args, null, JBitCask.CHUNK_SIZE);
     }
 
-    private static <T, A> A foldFileLoop(FileChannel fd, FileType type, BytesFoldFunction<T, A> foldFun,
-                                         KeyFoldFunction<A> intFoldFn, A acc, T args,
-                                         ByteBuffer prev, int chunkSize) throws IOException {
+    private static <T, A, R> A foldFileLoop(FileChannel fd, FileType type, BytesFoldFunction<T, A, R> foldFun,
+                                            RecordFoldFunction<A, R> intFoldFn, A acc, T args,
+                                            ByteBuffer prev, int chunkSize) throws IOException, InterruptedException {
         // analyze what happened in the last loop to determine whether or
         // not to change the read size. This is an optimization for large values
         // in datafile folds and key folds

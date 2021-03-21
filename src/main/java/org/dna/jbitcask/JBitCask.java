@@ -2,6 +2,7 @@ package org.dna.jbitcask;
 
 import org.dna.jbitcask.FileOperations.FileState;
 import org.dna.jbitcask.FileOperations.KeyFoldMode;
+import org.dna.jbitcask.FileOperations.KeyValueRecord;
 import org.dna.jbitcask.LockOperations.LockType;
 
 import java.io.EOFException;
@@ -334,7 +335,7 @@ public class JBitCask {
     }
 
     private static List<FileState> scanKeyFiles(List<Path> files, Keydir keydir, List<FileState> acc, boolean closeFile,
-                                             Function<byte[], byte[]> keyTransformer) throws IOException {
+                                             Function<byte[], byte[]> keyTransformer) throws IOException, InterruptedException {
         if (files.isEmpty()) {
             return acc;
         }
@@ -351,28 +352,28 @@ public class JBitCask {
 
         keydir.incrementFileId(fileTimestamp);
 
-        FileOperations.foldKeys(fileState, new FileOperations.KeyFoldFunction<KeyFoldMode>() {
+        FileOperations.foldKeys(fileState, new FileOperations.RecordFoldFunction<KeyFoldMode, FileOperations.KeyRecord>() {
             @Override
-            public KeyFoldMode fold(boolean tombstone, byte[] key, long timestamp, long offset, long totalSize, KeyFoldMode dontcare) {
-                if (tombstone) {
+            public KeyFoldMode fold(FileOperations.KeyRecord r, long timestamp, FileOperations.PosInfo pos, KeyFoldMode dontcare) {
+                if (r.isTombstone) {
                     try {
-                        final byte[] tranformedKey = keyTransformer.apply(key);
+                        final byte[] tranformedKey = keyTransformer.apply(r.key);
                         keydir.keydirRemove(keyTransformer.apply(tranformedKey));
                     } catch (Throwable ex) {
-                        System.err.printf("Invalid key on load %s: %s%n", key, ex);
+                        System.err.printf("Invalid key on load %s: %s%n", r.key, ex);
                     }
                 } else {
                     try {
-                        final byte[] tranformedKey = keyTransformer.apply(key);
+                        final byte[] tranformedKey = keyTransformer.apply(r.key);
                         keydir.keydirPut(tranformedKey,
                                 (int) fileTimestamp,
-                                (int) totalSize,
-                                offset,
+                                (int) pos.totalSize,
+                                pos.offset,
                                 timestamp,
                                 System.currentTimeMillis(),
                                 false);
                     } catch (Throwable ex) {
-                        System.err.printf("Invalid key on load %s: %s%n", key, ex);
+                        System.err.printf("Invalid key on load %s: %s%n", r.key, ex);
                     }
                 }
                 return null;
@@ -796,15 +797,15 @@ public class JBitCask {
     /**
      * Merge several data files within a bitcask datastore
      * */
-    public void merge(String dirname) throws IOException {
+    public void merge(String dirname) throws IOException, InterruptedException {
         merge(dirname, new Options(new Properties()));
     }
 
-    private void merge(String dirname, Options options) throws IOException {
+    private void merge(String dirname, Options options) throws IOException, InterruptedException {
         merge(dirname, options, readableFiles(dirname), new ArrayList<>());
     }
 
-    private void merge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException {
+    private void merge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException, InterruptedException {
         if (filesToMerge.isEmpty()) {
             return;
         }
@@ -821,7 +822,7 @@ public class JBitCask {
     }
 
     // Inner merge function, assumes that all files exist.
-    private void doMerge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException {
+    private void doMerge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException, InterruptedException {
         if (filesToMerge.isEmpty() && expiredFiles.isEmpty()) {
             return;
         }
@@ -968,17 +969,17 @@ public class JBitCask {
         final FileState file = files.remove(0);
         final long fileId = FileOperations.fileTimestamp(file);
 
-        FileOperations.KeyFoldFunction<KeyFoldMode> foldFunc = new FileOperations.KeyFoldFunction<KeyFoldMode>() {
+        FileOperations.RecordFoldFunction<KeyFoldMode, FileOperations.KeyRecord> foldFunc = new FileOperations.RecordFoldFunction<KeyFoldMode, FileOperations.KeyRecord>() {
             @Override
-            public KeyFoldMode fold(boolean tombstone, byte[] key, long timestamp, long offset, long totalSize, KeyFoldMode acc) {
-                if (tombstone) {
+            public KeyFoldMode fold(FileOperations.KeyRecord r, long timestamp, FileOperations.PosInfo pos, KeyFoldMode acc) {
+                if (r.isTombstone) {
                     return acc;
                 }
                 try {
-                    final byte[] kt = keyTransformer.apply(key);
-                    liveKeyDir.keydirRemove(kt, timestamp, (int) fileId, offset);
+                    final byte[] kt = keyTransformer.apply(r.key);
+                    liveKeyDir.keydirRemove(kt, timestamp, (int) fileId, pos.offset);
                 } catch (Exception ex) {
-                    LOG.error("Invalid key on merge {}", key, ex);
+                    LOG.error("Invalid key on merge {}", r.key, ex);
                 }
                 return acc;
             }
@@ -995,7 +996,7 @@ public class JBitCask {
         return files;
     }
 
-    private MergeState mergeFiles(MergeState state) throws IOException {
+    private MergeState mergeFiles(MergeState state) throws IOException, InterruptedException {
         if (state.inputFiles.isEmpty()) {
             return state;
         }
@@ -1003,10 +1004,12 @@ public class JBitCask {
         final List<FileState> rest = state.inputFiles;
         final long fileId = FileOperations.fileTimestamp(file);
 
-        FileOperations.KeyValueFoldFunction<MergeState> foldFunc = new FileOperations.KeyValueFoldFunction<MergeState>() {
+        FileOperations.RecordFoldFunction<MergeState, KeyValueRecord> foldFunc = new FileOperations.RecordFoldFunction<MergeState, KeyValueRecord>() {
 
             @Override
-            public MergeState fold(byte[] key0, byte[] value, long timestamp, FileOperations.PosInfo pos, MergeState state0) throws IOException, InterruptedException {
+            public MergeState fold(KeyValueRecord r, long timestamp, FileOperations.PosInfo pos, MergeState state0) throws IOException, InterruptedException {
+                byte[] key0 = r.key;
+                byte[] value = r.value;
                 final byte[] key;
                 try {
                     key = keyTransform.apply(key0);
