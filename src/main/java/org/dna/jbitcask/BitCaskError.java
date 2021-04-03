@@ -65,3 +65,9 @@ class InvariantViolationError extends RuntimeErrorException {
     }
 }
 
+class IterationInProcessError extends BitCaskError {}
+
+class OutOfDateError extends BitCaskError {}
+
+class IterationNotStartedError extends BitCaskError {}
+

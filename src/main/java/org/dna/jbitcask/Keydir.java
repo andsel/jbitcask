@@ -9,9 +9,13 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiFunction;
 
 final class Keydir {
 
@@ -50,7 +54,7 @@ final class Keydir {
         }
     }
 
-    private final class KeydirEntry implements AbstractKeydirEntry {
+    final class KeydirEntry implements AbstractKeydirEntry {
         int fileId;
         int totalSize;
         long offset;
@@ -138,6 +142,9 @@ final class Keydir {
     private long pendingUpdated;
     private long pendingStartTime; // UNIX epoch seconds (since 1970)
     private long pendingStartEpoch;
+    private List<SynchronousQueue<String>> pendingAwaken = new ArrayList<>(); // processes to wake once pending merged into entries
+    //private int pendingAwakenCount;
+    private ThreadLocal<SynchronousQueue<String>> threadLocalCspQueue = new ThreadLocal<>();
 
     private Lock mutex;
     private boolean ready = false;
@@ -836,6 +843,190 @@ final class Keydir {
         mutex.lock();
         updateFstats((int) fileId, 0, epoch, 0, 0, 0, 0, false);
         mutex.unlock();
+    }
+
+    public List<byte[]> keydirFold(BiFunction<List<byte[]>, KeydirEntry, List<byte[]>> fun, List<byte[]> acc, Long maxAge, Integer maxPuts) {
+        return frozen(fun, acc, maxAge, maxPuts);
+    }
+
+    // Execute the function once the keydir is frozen
+    private List<byte[]> frozen(BiFunction<List<byte[]>, KeydirEntry, List<byte[]>> frozenFun, List<byte[]> acc, long maxAge, int maxPuts) {
+        try {
+            keydirStartIterating(System.currentTimeMillis(), maxAge, maxPuts);
+            try {
+                if (!iterating) {
+                    LOG.debug("Itr not started");
+                    // Iteration not started!
+                    throw new IterationNotStartedError();
+                }
+                mutex.lock();
+                final List<byte[]> reduced = entries.values().stream().map(e -> (KeydirEntry) e)
+                        .reduce(acc, frozenFun, (bytes, bytes2) -> {
+                            bytes.addAll(bytes2);
+                            return bytes;
+                        });
+                mutex.unlock();
+
+                return reduced;
+            } finally {
+                iteratorRelease();
+            }
+        } catch (OutOfDateError outOfDate) {
+            keydirWaitReady();
+            return frozen(frozenFun, acc, -1, -1);
+        }
+    }
+
+    // Wait for any pending iteration to complete
+    private void keydirWaitReady() {
+        // Create an iterator, passing a zero timestamp to force waiting for
+        // any current iteration to complete
+        try {
+            keydirStartIterating(0, 0, 0);
+            iteratorRelease();
+        } catch (OutOfDateError outOfDate) {
+            // no iter created, wait for message from last fold_keys
+            // suspend the thread
+            try {
+                cspQueueOrCreate().take();
+            } catch (InterruptedException ex) {
+                LOG.error("Interrupted while wait on keydir ready", ex);
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+
+    /**
+     * @throws OutOfDateError
+     * @throws IterationInProcessError
+     * */
+    private void keydirStartIterating(long timestamp, long maxAge, int maxPuts) {
+        mutex.lock();
+        LOG.trace("+++ itr");
+        // If a iterator thread is already active for this keydir, bail
+        if (iterating) {
+            mutex.unlock();
+            throw new IterationInProcessError();
+        }
+        if (canIterate(timestamp ,maxAge, maxPuts)) {
+            epoch += 1;
+            iterating = true;
+            newestFolder = epoch;
+            keyfolders ++;
+            LOG.debug("itr started, keydir->pending = {}", pending);
+            mutex.unlock();
+        } else {
+            SynchronousQueue<String> currentThreadMsgQueue = cspQueueOrCreate();
+            pendingAwaken.add(currentThreadMsgQueue);
+            mutex.unlock();
+            throw new OutOfDateError();
+        }
+    }
+
+    private SynchronousQueue<String> cspQueueOrCreate() {
+        SynchronousQueue<String> queue = threadLocalCspQueue.get();
+        if (queue == null) {
+            queue = new SynchronousQueue<>();
+            threadLocalCspQueue.set(queue);
+        }
+
+        return queue;
+    }
+
+    // Helper for keydir_itr to decide if it is valid to iterate over entries.
+    // Check the number of updates since pending was created is less than the maximum
+    // and that the current view is not too old.
+    // Call with timestamp set to zero to force a wait on any pending keydir.
+    // Set maxAge or maxPuts negative to ignore them.  Set both negative to force
+    // using the keydir - useful when a process has waited once and needs to run
+    // next time.
+    private boolean canIterate(long timestamp, long maxAge, int maxPuts) {
+        if (pending == null // not frozen or caller wants to reuse
+                || (maxAge < 0 && maxPuts < 0)) { // the exiting freeze
+            return true;
+        } else if (timestamp == 0 || timestamp < pendingStartTime)  { // if clock skew (or forced wait), force key folding to wait
+            return false; // which will fix pendingStart
+        }
+
+        final long age = timestamp - pendingStartTime;
+        return ((maxAge < 0 || age < maxAge) && (maxPuts < 0 || pendingUpdated <= maxPuts));
+    }
+
+    private void iteratorRelease() {
+        mutex.lock();
+        if (!iterating) {
+            // Iteration not started!
+            mutex.unlock();
+            throw new IterationNotStartedError();
+        }
+        iteratorReleaseInternal();
+        mutex.unlock();
+    }
+
+    private void iteratorReleaseInternal() {
+        iterating = false;
+        keyfolders --;
+        epoch = MAX_EPOCH;
+
+        // If last iterator closing, unfreeze keydir and merge pending entries.
+        if (keyfolders == 0 && pending != null && pending.isEmpty()) {
+            mergePendingEntries();
+            iterGeneration ++;
+        }
+    }
+
+    // Merge pending hash into entries hash and awaken any pids that want to
+    // start iterating once we are merged.  keydir must be locked before calling.
+    private void mergePendingEntries() {
+        LOG.debug("Merge pending entries. Keydir before merging");
+        for (Map.Entry<byte[], KeydirEntry> e : pending.entrySet()) {
+            final KeydirEntry pendingEntry = e.getValue();
+            LOG.debug("Pending Entry: key={} key_sz={} file_id={} tstamp={} offset={} size={}", pendingEntry.key,
+                    pendingEntry.key.length, pendingEntry.fileId, pendingEntry.tstamp, pendingEntry.offset,
+                    pendingEntry.totalSize);
+            if (!entries.containsKey(e.getKey())) {
+                // entries: empty, pending:tombstone
+                if (pendingEntry.isPendingTombstone()) {
+                    //NOP
+                } else {
+                    // entries: empty, pending:value
+                    // Move to entries, do not free
+                    entries.put(e.getKey(), pendingEntry);
+                }
+            } else {
+                final KeydirEntry entriesEntry = (KeydirEntry) entries.get(e.getKey());
+                LOG.debug("Entries Entry: key={} key_sz={} file_id={} tstamp={} offset={} size={}", entriesEntry.key,
+                        entriesEntry.key.length, entriesEntry.fileId, entriesEntry.tstamp, entriesEntry.offset,
+                        entriesEntry.totalSize);
+                if (pendingEntry.isPendingTombstone()) {
+                    // entries: present, pending:tombstone
+                    entries.remove(e.getKey());
+                } else {
+                    // entries: present, pending:value
+                    entries.put(e.getKey(), pendingEntry);
+                }
+            }
+        }
+
+        // Wake up all sleeping pids
+        for (SynchronousQueue<String> csp : pendingAwaken) {
+            try {
+                // this block until the awaken thread doesn't call take()
+                csp.put("Awake from " + Thread.currentThread());
+            } catch (InterruptedException ex) {
+                // try to awake all other threads
+                LOG.error("Error while awakening thread CSP", ex);
+            }
+        }
+
+        // Free all resources for keydir folding
+        pending = null;
+        pendingUpdated = 0;
+        pendingStartTime = 0L;
+        pendingStartEpoch = 0;
+        pendingAwaken = null;
+        LOG.debug("Merge pending entries completed");
     }
 }
 

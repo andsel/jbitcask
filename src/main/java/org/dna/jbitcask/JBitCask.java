@@ -23,6 +23,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.Logger;
@@ -1334,4 +1335,66 @@ public class JBitCask {
         put(key, TOMBSTONE2_BIN);
     }
 
+    /**
+     * List all keys in a bitcask datastore.
+     * */
+    public List<byte[]> listKeys() {
+        final BiFunction<List<byte[]>, Keydir.KeydirEntry, List<byte[]>> fun = (acc, entry) -> {
+            acc.add(entry.key);
+            return acc;
+        };
+        return foldKeys(fun, new ArrayList<>());
+    }
+
+    /**
+     * Fold over all keys in a bitcask datastore.
+     * Must be able to understand the bitcask_entry record form.
+     * */
+    public List<byte[]> foldKeys(BiFunction<List<byte[]>, Keydir.KeydirEntry, List<byte[]>> fun, List<byte[]> acc) {
+        long maxAge = state.opts.get(Options.MAX_FOLD_AGE) * 1000; // convert from ms to us
+        int maxPuts = state.opts.get(Options.MAX_FOLD_PUTS);
+        return foldKeys(fun, acc, maxAge, maxPuts, false);
+    }
+
+    /**
+     * Fold over all keys in a bitcask datastore with limits on how out of date the keydir is allowed to be.
+     * Must be able to understand the bitcask_entry record form.
+     * */
+    protected List<byte[]> foldKeys(BiFunction<List<byte[]>, Keydir.KeydirEntry, List<byte[]>> fun, List<byte[]> acc0,
+                                    Long maxAge, Integer maxPuts, boolean seeTombstones) {
+        if (maxAge != null && maxAge < 0) {
+            throw new IllegalArgumentException("maxAge must be positive");
+        }
+        if (maxPuts != null && maxPuts < 0) {
+            throw new IllegalArgumentException("maxPuts must be positive");
+        }
+        final long expiryTime = state.opts.get(Options.EXPIRY_TIME);
+
+        final BiFunction<List<byte[]>, Keydir.KeydirEntry, List<byte[]>> realFun = (acc, entry) -> {
+            final byte[] key = entry.key;
+            if (entry.tstamp < expiryTime) {
+                return acc;
+            }
+            if (isTombstoneSize(entry.totalSize - (HEADER_SIZE + key.length))) {
+                // might be a deleted record, so check
+                try {
+                    get(key);
+                    return fun.apply(acc, entry);
+                } catch (NotFoundError notFound) {
+                    if (!seeTombstones) {
+                        return acc;
+                    } else {
+// TODO                        return fun.apply({tombstone, entry}, acc);
+                        return fun.apply(acc, entry);
+                    }
+                } catch (IOException ioex) {
+                    throw new RuntimeException(ioex);
+                }
+            } else {
+                return fun.apply(acc, entry);
+            }
+        };
+
+        return state.keydir.keydirFold(realFun, acc0, maxAge, maxPuts);
+    }
 }

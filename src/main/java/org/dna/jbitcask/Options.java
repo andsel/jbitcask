@@ -48,8 +48,11 @@ public final class Options {
     public static final Option<Long> EXPIRY_TIME = new Option<>("expiry_time", Long.class, 0L, Long::parseLong);
     public static final Option<Long> EXPIRY_GRACE_TIME = new Option<>("expiry_grace_time", Long.class, 0L, Long::parseLong);
     public static final Option<Long> MAX_FILE_SIZE = new Option<>("max_file_size", Long.class, 0L, Long::parseLong);
+    //milliseconds
+    public static final Option<Long> MAX_FOLD_AGE = new Option<>("max_fold_age", Long.class, 0L, Long::parseLong);
     public static final Option<Long> OPEN_TIMEOUT = new Option<>("open_timeout", Long.class, 0L, Long::parseLong);
     public static final Option<Byte> TOMBSTONE_VERSION = new Option<>("tombstone_version", Byte.class, (byte)0, Byte::parseByte);
+    public static final Option<Integer> MAX_FOLD_PUTS = new Option<>("max_fold_puts", Integer.class, 0, Integer::parseInt);
 
     private final Properties props;
 
