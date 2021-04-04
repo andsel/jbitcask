@@ -65,6 +65,8 @@ class FileOperations {
     }
 
     static class FileState {
+        static final FileState FRESH = new FileState(OpenMode.APPEND, "FRESH", -1, null, -1);
+
         private final OpenMode mode; //File mode: read_only, read_write
         private final String filename;
         private final long timestamp; //Tstamp portion of filename
@@ -119,6 +121,10 @@ class FileOperations {
 
         public void close() throws IOException {
             fd.close();
+        }
+
+        public void sync() throws IOException {
+            fd.force(true);
         }
     }
 

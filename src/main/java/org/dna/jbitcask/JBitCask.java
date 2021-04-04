@@ -1397,4 +1397,14 @@ public class JBitCask {
 
         return state.keydir.keydirFold(realFun, acc0, maxAge, maxPuts);
     }
+
+    /**
+     * Force any writes to sync to disk.
+     * */
+    public void synch() throws IOException {
+        if (state.writeFile == null || state.writeFile == FileState.FRESH) {
+            return;
+        }
+        state.writeFile.sync();
+    }
 }
