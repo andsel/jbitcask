@@ -30,6 +30,8 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.LogManager;
 import java.util.stream.Collectors;
 
+import static org.dna.jbitcask.FileOperations.FileState.FRESH;
+
 public class JBitCask {
 
     // Bitcask instance state
@@ -73,7 +75,7 @@ public class JBitCask {
         private final Set<Long> inputFileIds;
         private final long minFileId;
         private List<FileState> tombstoneWriteFiles = new ArrayList<>();
-        FileState outFile = null; //fresh // will be created when needed
+        FileState outFile = FRESH; //fresh, will be created when needed
         private final MergeCoverage mergeCoverage;
         private final Keydir liveKeydir;
         private final Keydir delKeydir;
@@ -191,7 +193,7 @@ public class JBitCask {
             throw new FileNotFoundException("bitcask directory doesn't exists: " + path);
         }
 
-        FileState writingFile = null;
+        FileState writingFile;
 
         // If the read_write option is set, attempt to release any stale write lock.
         // Do this first to avoid unnecessary processing of files for reading.
@@ -200,9 +202,8 @@ public class JBitCask {
             // and loading anyway: if later someone tries to write
             // something, that someone will get a write_locked exception.
             LockOperations.deleteStaleLock(LockType.WRITE, dirname);
-            //TODO writingFile is fresh
+            writingFile = FRESH;
         } else {
-            //TODO writingFile is undefined
             writingFile = null;
         }
 
@@ -433,8 +434,7 @@ public class JBitCask {
         try {
             writeLock = LockOperations.acquire(LockType.WRITE, dirname);
         } catch (LockOperations.AlreadyLockedException | IOException ex) {
-            //TODO use logger
-            System.err.printf("Lock failed trying deleting stale merge input files from %s %s %n", dirname, ex);
+            LOG.error("Lock failed trying deleting stale merge input files from %s %s %n", dirname, ex);
             return;
         }
 
@@ -521,8 +521,7 @@ public class JBitCask {
      * Close a bitcask data store and flush any pending writes to disk.
      */
     public void close() throws IOException {
-        if (state.writeFile != null) {
-            // TODO check it is not fresh
+        if (state.writeFile != null && state.writeFile != FRESH) {
             //Cleanup the write file and associated lock
             FileOperations.closeForWriting(state.writeFile);
             LockOperations.release(state.writeLock);
@@ -920,8 +919,9 @@ public class JBitCask {
         final MergeState state1 = mergeFiles(state);
 
         // Make sure to close the final output file
-        // TODO handle fresh state (bitcask.erl L714)
-        state1.outFile.close();
+        if (state1.outFile != FRESH) {
+            state1.outFile.close();
+        }
 
         for (FileState tfile : state1.tombstoneWriteFiles) {
             tfile.close();
@@ -1401,8 +1401,8 @@ public class JBitCask {
     /**
      * Force any writes to sync to disk.
      * */
-    public void synch() throws IOException {
-        if (state.writeFile == null || state.writeFile == FileState.FRESH) {
+    public void sync() throws IOException {
+        if (state.writeFile == null || state.writeFile == FRESH) {
             return;
         }
         state.writeFile.sync();

@@ -1,5 +1,8 @@
 package org.dna.jbitcask;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.io.EOFException;
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -24,6 +27,8 @@ import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 
 class FileOperations {
+
+    private static final Logger LOG = LogManager.getLogger(FileOperations.class);
 
     static final short HINT_RECORD_SZ = 18;// Tstamp(4) + KeySz(2) + TotalSz(4) + Offset(8)
 
@@ -438,7 +443,9 @@ class FileOperations {
     }
 
     static KeyFoldMode foldKeys(FileState state, RecordFoldFunction<KeyFoldMode, KeyRecord> foldFunc, KeyFoldMode acc) {
-        // TODO if state == :fresh return acc
+        if (state == FileState.FRESH) {
+            return acc;
+        }
         return foldKeys(state, foldFunc, KeyFoldMode.DEFAULT);
     }
 
@@ -556,7 +563,7 @@ class FileOperations {
             return foldHintfile(state, foldFun, acc);
         } else {
             String hintFile = hintfileName(state);
-            System.err.printf("Hintfile '%s' invalid%n", hintFile);
+            LOG.error("Hintfile '{}' invalid", hintFile);
             return foldKeysLoop(state, 0, foldFun, acc);
         }
     }
@@ -586,7 +593,9 @@ class FileOperations {
     }
 
     public static <A> A fold(FileState f, RecordFoldFunction<A, KeyValueRecord> fun, A acc) throws IOException, InterruptedException {
-        //TODO if f.isFresh() return acc
+        if (f == FileState.FRESH) {
+            return acc;
+        }
         //TODO: Add some sort of check that this is a read-only file
         f.fd.position(0L);
         PosInfo posInfo = new PosInfo(f.filename, f.timestamp, 0, 0 );
@@ -640,7 +649,7 @@ class FileOperations {
     private static <A> BytesFoldFunResult<KeyData, A> foldKeysIntLoop(ByteBuffer data, RecordFoldFunction<A, KeyRecord> fun, A acc, long consumed,
                                                                       KeyData args) throws IOException, InterruptedException {
         if (args.crcSkipCount == 20) {
-            System.err.printf("fold_loop: CRC error limit at file %s offset %d%n", args.filename, args.offset);
+            LOG.error("fold_loop: CRC error limit at file {} offset {}", args.filename, args.offset);
             return new BytesFoldFunResult<>(BytesFoldFunResult.Type.DONE, acc);
         }
         try {
@@ -663,7 +672,7 @@ class FileOperations {
             crcCodec.update(value);
             final long calcCrc = crcCodec.getValue();
             if (crc32 != calcCrc) {
-                System.err.printf("fold_loop: CRC error at file %s offset %d, skipping %d bytes%n", args.filename, args.offset, totalSize);
+                LOG.error("fold_loop: CRC error at file {} offset {}, skipping {} bytes", args.filename, args.offset, totalSize);
                 return foldKeysIntLoop(data, fun, acc, consumed + totalSize,
                         new KeyData(args.filename, args.fTStamp, args.offset + totalSize, args.crcSkipCount + 1));
             }
