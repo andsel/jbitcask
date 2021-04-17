@@ -9,6 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -70,7 +73,9 @@ class IO {
             options.add(StandardOpenOption.SYNC);
         }
         // Try to open the lock file
-        FileChannel channel = FileChannel.open(filename, options);
+        final Set<PosixFilePermission> filePerms = PosixFilePermissions.fromString("rw-------");
+        final FileAttribute<Set<PosixFilePermission>> permsAttrs = PosixFilePermissions.asFileAttribute(filePerms);
+        FileChannel channel = FileChannel.open(filename, options, permsAttrs);
         return new BCFileLock(channel, filename, writelock);
     }
 
