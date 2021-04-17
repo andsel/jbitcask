@@ -42,20 +42,21 @@ class FileOperations {
     static void delete(Path file) {
         file.toFile().delete();
         if (hasHintFile(file)) {
-            new File(hintFilename(file)).delete();
+            hintFilename(file).toFile().delete();
         }
     }
 
     private static boolean hasHintFile(Path file) {
-        return new File(hintFilename(file)).exists();
+        return hintFilename(file).toFile().exists();
     }
 
-    private static String hintFilename(Path file) {
-        if (file.endsWith(".data")) {
-            final String fullpath = file.toString();
-            return fullpath.replace(".data", "") + ".hint";
-        }
-        return file.toString();
+    private static Path hintFilename(Path file) {
+//        if (file.endsWith(".data")) {
+//            final String fullpath = file.toString();
+//            return Path.of(fullpath.replace(".data", "") + ".hint");
+//        }
+//        return file;
+        return Path.of(hintfileName(file.toString()));
     }
 
     private static String hintfileName(String filename) {
@@ -138,15 +139,10 @@ class FileOperations {
      * Called on a Dirname, will open a fresh file in that directory.
      */
     static FileState createFile(String dirname, Options opts, Keydir keydir) throws IOException, InterruptedException {
-        final IO.BCFileLock lock;
-        try {
-            lock = getCreateLock(dirname);
-        } catch (IOException | InterruptedException ex) {
-            throw ex;
-        }
+        final IO.BCFileLock lock = getCreateLock(dirname);
         try {
             final long newest = keydir.incrementFileId();
-            final String filename = mkFilename(dirname, newest);
+            final Path filename = mkFilename(dirname, newest);
             ensureDir(filename);
 
             // Check for o_sync strategy and add to opts
@@ -157,21 +153,20 @@ class FileOperations {
                 options.add(StandardOpenOption.SYNC);
             }
             // Try to open the lock file
-            final FileChannel fd = FileChannel.open(Path.of(filename), options);
-            final FileChannel hintFD = openHintFile(Path.of(filename), options.toArray(new OpenOption[0]));
-            return new FileState(OpenMode.READ_WRITE, filename, fileTimestamp(filename), fd, 0, 0, hintFD);
+            final FileChannel fd = FileChannel.open(filename, options);
+            final FileChannel hintFD = openHintFile(filename, options.toArray(new OpenOption[0]));
+            return new FileState(OpenMode.READ_WRITE, filename.toString(), fileTimestamp(filename), fd, 0, 0, hintFD);
         } finally {
             LockOperations.release(lock);
         }
     }
 
-    private static void ensureDir(String filename) throws IOException {
-        final Path fullPath = Paths.get(filename);
+    private static void ensureDir(Path fullPath) throws IOException {
         Files.createDirectories(fullPath.getParent());
     }
 
-    static String mkFilename(String dirname, long newest) {
-        return Paths.get(dirname, newest + ".bitcask.data").toString();
+    static Path mkFilename(String dirname, long newest) {
+        return Paths.get(dirname, newest + ".bitcask.data");
     }
 
     private static IO.BCFileLock getCreateLock(String dirname) throws IOException, InterruptedException {
@@ -276,10 +271,10 @@ class FileOperations {
      * throws BitCaskError if file can't be open
      */
     private static FileChannel openHintFile(Path filename, OpenOption... options) throws IOException {
-        final String hintFilename = hintFilename(filename);
+        final Path hintFilename = hintFilename(filename);
         for (int i = 0; i < 10; i++) {
             try {
-                return FileChannel.open(Path.of(hintFilename), options);
+                return FileChannel.open(hintFilename, options);
             } catch (FileAlreadyExistsException ex) {
                 // continue the loop
                 try {
@@ -350,10 +345,6 @@ class FileOperations {
 
     static long fileTimestamp(Path filename) {
         return fileTimestamp(filename.getFileName().toString());
-    }
-
-    static long fileTimestamp(FileState fileState) {
-        return fileState.timestamp;
     }
 
     static class HintfileData {
@@ -822,8 +813,11 @@ class FileOperations {
      */
     public static FileState closeForWriting(FileState fileState) throws IOException {
         final FileState state = closeHintfile(fileState);
-        fileState.fd.force(false);
-        return new FileState(OpenMode.READONLY, state.filename, state.timestamp, state.fd, state.ofs,
+        fileState.fd.force(false); //TODO is it needed? close
+        fileState.fd.close();
+
+        final FileChannel readFd = FileChannel.open(Path.of(fileState.filename), StandardOpenOption.READ);
+        return new FileState(OpenMode.READONLY, state.filename, state.timestamp, /*state.fd*/ readFd, state.ofs,
                 state.hintcrc, state.hintfd);
     }
 
@@ -874,18 +868,22 @@ class FileOperations {
         return b.flip();
     }
 
-    enum WriteResponse {FRESH, WRAP, OK}
+    enum WriteType {FRESH, WRAP, OK}
 
-    public static WriteResponse checkWrite(FileState fileState, byte[] key, int valSize, long maxSize) {
-        if (fileState == null) {
+    /**
+     * Given the key to insert and the size of the value (in bytes) determines if the storing
+     * of the record pass the max size of a file, so it has to wrap, or it's ok.
+     * */
+    public static WriteType checkWrite(FileState fileState, byte[] key, int valSize, long maxSize) {
+        if (fileState == FileState.FRESH ) {
             // for the very first write, special-case
-            return WriteResponse.FRESH;
+            return WriteType.FRESH;
         }
         final int size = JBitCask.HEADER_SIZE + key.length + valSize;
         if (fileState.ofs + size > maxSize) {
-            return WriteResponse.WRAP;
+            return WriteType.WRAP;
         } else {
-            return WriteResponse.OK;
+            return WriteType.OK;
         }
     }
 
@@ -916,7 +914,7 @@ class FileOperations {
         }
         final int fieldSize = JBitCask.TSTAMPFIELD + JBitCask.KEYSIZEFIELD + JBitCask.VALSIZEFIELD + key.length + value.length;
         final ByteBuffer field = ByteBuffer.allocate(fieldSize);
-        field.putInt((int) timestamp).putInt(key.length).putInt(value.length).put(key).put(value).flip();
+        field.putInt((int) timestamp).putShort((short) key.length).putInt(value.length).put(key).put(value).flip();
         final CRC32 crcCalculator = new CRC32();
         crcCalculator.update(field);
         final long crc = crcCalculator.getValue();
@@ -981,13 +979,25 @@ class FileOperations {
     public static KeyValue read(FileState fileState, long offset, int size) throws IOException {
         final ByteBuffer data = ByteBuffer.allocate(size);
         fileState.fd.read(data, offset);
-        final int crc32 = data.getInt();
+        data.flip();
+        byte[] crcBytes = new byte[4];
+        data.get(crcBytes);
         data.mark();
+
+        long crc32 = (crcBytes[3] & 0xFF) | (crcBytes[2]<<8 & 0xFF00) | (crcBytes[1]<<16 & 0xFF0000) | (crcBytes[0]<<24 & 0x00FF000000L);
+        // DBG
+//        StringBuilder sb = new StringBuilder();
+//        for (byte b : crcBytes) {
+//            sb.append(String.format("%02X ", b));
+//        }
+//        System.out.println(sb);
+//        // DBG
+
         // Verify the CRC of the data
         final CRC32 crcCodec = new CRC32();
         crcCodec.update(data);
         if (crc32 != crcCodec.getValue()) {
-            throw new BadCrcError();
+            throw new BadCrcError("crc32 read: " + crc32 + ", calculated: " + crcCodec.getValue());
         }
         // Unpack the actual data
         data.reset();

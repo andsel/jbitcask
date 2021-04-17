@@ -34,7 +34,11 @@ class ReadOnlyError extends BitCaskError {}
 
 class NoFileError extends BitCaskError {}
 
-class BadCrcError extends BitCaskError {}
+class BadCrcError extends BitCaskError {
+    public BadCrcError(String s) {
+        super(s);
+    }
+}
 
 class MergeLockedError extends BitCaskError {}
 

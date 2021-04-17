@@ -7,6 +7,7 @@ import org.dna.jbitcask.FunctionResult.Atom;
 import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -20,6 +21,31 @@ import java.util.function.BiFunction;
 final class Keydir {
 
     private static final Logger LOG = LogManager.getLogger(Keydir.class);
+
+    final static class BytesKey {
+        private final byte[] array;
+
+        public BytesKey(byte[] array) {
+            this.array = array;
+        }
+
+        public byte[] getArray() {
+            return array.clone();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            BytesKey bytesKey = (BytesKey) o;
+            return Arrays.equals(array, bytesKey.array);
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(array);
+        }
+    }
 
     static class BitcaskPrivData {
         Lock globalKeydirsLock = new ReentrantLock();
@@ -121,11 +147,11 @@ final class Keydir {
 
     // The hash where entries are usually stored. It may contain
     // regular entries or entry lists created during keyfolding.
-    private final Map<byte[], AbstractKeydirEntry> entries = new HashMap<>();
+    private final Map<BytesKey, AbstractKeydirEntry> entries = new HashMap<>();
     // Hash used when it's not possible to update entries without
     // resizing it, which would break ongoing keyfolder on it.
     // It can only contain regular entries, not entry lists.
-    private Map<byte[], KeydirEntry> pending;
+    private Map<BytesKey, KeydirEntry> pending;
     private final Map<Integer, FstatsEntry> fstats = new HashMap<>();
     private boolean iterating = false;
     private long epoch;
@@ -138,7 +164,7 @@ final class Keydir {
     private long iterGeneration;
     private short iterMutation; // Mutation while iterating?
     private long sweepLastGeneration; // iter_generation of last sibling sweep
-    private Iterator<Map.Entry<byte[], AbstractKeydirEntry>> sweepIter = entries.entrySet().iterator(); // iterator for sibling sweep entries.
+    private Iterator<Map.Entry<BytesKey, AbstractKeydirEntry>> sweepIter = entries.entrySet().iterator(); // iterator for sibling sweep entries.
     private long pendingUpdated;
     private long pendingStartTime; // UNIX epoch seconds (since 1970)
     private long pendingStartEpoch;
@@ -223,9 +249,7 @@ final class Keydir {
         if (conditionalFileId == null || conditionalFileId == 0) {
             biggestFileId++;
         } else {
-            if (conditionalFileId > biggestFileId) {
-                biggestFileId = conditionalFileId;
-            }
+            biggestFileId = Math.max(biggestFileId, conditionalFileId);
         }
         long newId = biggestFileId;
         mutex.unlock();
@@ -237,18 +261,19 @@ final class Keydir {
     }
 //TODO revisit in case is conditional is true
     public void keydirRemove(byte[] key, long timestampMillis) {
+        final BytesKey bytesKey = new BytesKey(key);
         int removeTime = 0;
         mutex.lock();
         this.epoch += 1;
         LOG.debug("+++ Remove");
         perhapsSweepSiblings();
-        final FindResult fr = findKeydirEntry(key, this.epoch);
+        final FindResult fr = findKeydirEntry(bytesKey, this.epoch);
         if (!fr.found || fr.proxy.isTombstone) {
             // not found
             mutex.unlock();
             return;
         }
-        dokeydirRemove(key, removeTime, fr);
+        dokeydirRemove(bytesKey, removeTime, fr);
         mutex.unlock();
     }
 
@@ -264,7 +289,8 @@ final class Keydir {
         this.epoch += 1;
         LOG.debug("+++ Remove conditional");
         perhapsSweepSiblings();
-        final FindResult fr = findKeydirEntry(key, this.epoch);
+        final BytesKey bytesKey = new BytesKey(key);
+        final FindResult fr = findKeydirEntry(bytesKey, this.epoch);
         if (!fr.found || fr.proxy.isTombstone) {
             // not found
             mutex.unlock();
@@ -278,11 +304,11 @@ final class Keydir {
             LOG.debug("+++Conditional no match");
             throw new AlreadyExistsError();
         }
-        dokeydirRemove(key, removeTime, fr);
+        dokeydirRemove(bytesKey, removeTime, fr);
         mutex.unlock();
     }
 
-    private void dokeydirRemove(byte[] key, int removeTime, FindResult fr) {
+    private void dokeydirRemove(BytesKey key, int removeTime, FindResult fr) {
         // Remove the key from the keydir stats
         keyCount --;
         keyBytes -= fr.proxy.key.length;
@@ -321,7 +347,7 @@ final class Keydir {
     // Adds a tombstone to an existing entries hash entry. Regular entries are
     // converted to lists first. Only to be called during iterations.
     // Entries are simply removed when there are no iterations.
-    private void setEntryTombstone(byte[] key, AbstractKeydirEntry entry, int removeTime, long removeEpoch) {
+    private void setEntryTombstone(BytesKey key, AbstractKeydirEntry entry, int removeTime, long removeEpoch) {
         KeydirEntry tombstone = new KeydirEntry();
         tombstone.tstamp = removeTime;
         tombstone.epoch = removeEpoch;
@@ -390,7 +416,7 @@ final class Keydir {
 
     // Find an entry in the pending hash when they keydir is frozen, or in the
     // entries hash otherwise.
-    private FindResult findKeydirEntry(byte[] key, long epoch) {
+    private FindResult findKeydirEntry(BytesKey key, long epoch) {
         // Search pending. If keydir handle used is in iterating mode
         // we want to see a past snapshot instead.
         final FindResult ret = new FindResult();
@@ -398,7 +424,7 @@ final class Keydir {
 
             ret.pendingEntry = pending.get(key);
             if (ret.pendingEntry != null && epoch >= ret.pendingEntry.epoch) {
-                System.out.printf("Found in pending %d > %d%n", epoch, ret.pendingEntry.epoch);
+                LOG.debug("Found in pending {} > {}", epoch, ret.pendingEntry.epoch);
                 ret.hash = this.pending;
                 ret.entriesEntry = null;
                 ret.found = true;
@@ -411,13 +437,16 @@ final class Keydir {
 
         // If a snapshot for that time is found in regular entries
         final AbstractKeydirEntry entryProxies = entries.get(key);
-        ret.entriesEntry = entryProxies;
-        ret.proxy = findProxyAtEpoch(entryProxies, epoch);
-        if (entryProxies != null && ret.proxy != null) {
-            ret.hash = this.entries;
-            ret.found = true;
-            return ret;
+        if (entryProxies != null) {
+            ret.proxy = findProxyAtEpoch(entryProxies, epoch);
+            if (ret.proxy != null) {
+                ret.entriesEntry = entryProxies;
+                ret.hash = this.entries;
+                ret.found = true;
+                return ret;
+            }
         }
+
         ret.entriesEntry = null;
         ret.hash = null;
         ret.found = false;
@@ -442,7 +471,7 @@ final class Keydir {
                 sweepLastGeneration = iterGeneration;
                 return;
             }
-            Map.Entry<byte[], AbstractKeydirEntry> val = sweepIter.next();
+            Map.Entry<BytesKey, AbstractKeydirEntry> val = sweepIter.next();
             if (val.getValue() != null && (val.getValue() instanceof ListKeydirEntry)) {
                 ListKeydirEntry listVal = (ListKeydirEntry) val.getValue();
                 if (listVal.size() > 1) {
@@ -463,7 +492,7 @@ final class Keydir {
     // Use updateRegularEntry on pending hash entries instead.
     // While iterating, regular entries will become entry lists,
     // otherwise the result is a regular, single value entry.
-    private void updateEntry(byte[] key, EntryProxy newValue) {
+    private void updateEntry(BytesKey key, EntryProxy newValue) {
         final AbstractKeydirEntry currentEntry = entries.get(key);
         final boolean iterating = keyfolders > 0;
         if (iterating) {
@@ -588,10 +617,11 @@ final class Keydir {
                 key, entry.fileId, (int) entry.offset, entry.totalSize, entry.tstamp);
         perhapsSweepSiblings();
 
-        final FindResult f = findKeydirEntry(key, MAX_EPOCH);
+        final BytesKey bytesKey = new BytesKey(key);
+        final FindResult f = findKeydirEntry(bytesKey, MAX_EPOCH);
 
         // If conditional put and not found, bail early
-        if ((!f.found || f.proxy.isTombstone) && oldFileId != null) {
+        if ((!f.found || f.proxy.isTombstone) && oldFileId != 0) {
             LOG.debug("file already exists");
             mutex.unlock();
             throw new AlreadyExistsError();
@@ -608,7 +638,7 @@ final class Keydir {
         }
 
         if (!f.found || f.proxy.isTombstone) {
-            if ((newestPut && (entry.fileId < biggestFileId)) || oldFileId != null) {
+            if ((newestPut && (entry.fileId < biggestFileId)) || oldFileId != 0) {
                 mutex.unlock();
                 // already exists
                 throw new AlreadyExistsError();
@@ -621,7 +651,7 @@ final class Keydir {
             // Increment live and total stats.
             updateFstats(entry.fileId, entry.tstamp, MAX_EPOCH, 1, 1, entry.totalSize, entry.totalSize, true);
 
-            putEntry(key, f, entry);
+            putEntry(bytesKey, f, entry);
             LOG.debug("+++ Put new, !found || !tombstone");
             mutex.unlock();
             return;
@@ -676,7 +706,7 @@ final class Keydir {
                         entry.totalSize - f.proxy.totalSize,
                         entry.totalSize, true);
             }
-            putEntry(key, f, entry);
+            putEntry(bytesKey, f, entry);
             mutex.unlock();
             LOG.debug("Finished put");
             return;
@@ -694,7 +724,7 @@ final class Keydir {
 
     // Adds or updates an entry in the pending hash if they keydir is frozen
     // or in the entries hash otherwise.
-    private void putEntry(byte[] key, FindResult r, KeydirEntry entry) {
+    private void putEntry(BytesKey key, FindResult r, KeydirEntry entry) {
         if (r.pendingEntry != null) {
             // found in pending (keydir is frozen), update that one
             updateRegularEntry(r.pendingEntry, entry);
@@ -758,7 +788,7 @@ final class Keydir {
      * @throws KeyNotFoundError
      * */
     public EntryProxy get(byte[] key) throws KeyNotFoundError {
-        return get(key, 0xffff_ffff_ffff_ffffL);
+        return get(key, Long.MAX_VALUE);
     }
 
     /**
@@ -767,7 +797,7 @@ final class Keydir {
     public EntryProxy get(byte[] key, long epoch) throws KeyNotFoundError {
         mutex.lock();
         perhapsSweepSiblings();
-        final FindResult f = findKeydirEntry(key, epoch);
+        final FindResult f = findKeydirEntry(new BytesKey(key), epoch);
         if (f.found && !f.proxy.isTombstone) {
             LOG.debug(" ... returned value file id=%d size=%d ofs=%d tstamp=%d tomb=%s",
                     f.proxy.fileId, f.proxy.totalSize, f.proxy.offset, f.proxy.tstamp, f.proxy.isTombstone);
@@ -980,7 +1010,7 @@ final class Keydir {
     // start iterating once we are merged.  keydir must be locked before calling.
     private void mergePendingEntries() {
         LOG.debug("Merge pending entries. Keydir before merging");
-        for (Map.Entry<byte[], KeydirEntry> e : pending.entrySet()) {
+        for (Map.Entry<BytesKey, KeydirEntry> e : pending.entrySet()) {
             final KeydirEntry pendingEntry = e.getValue();
             LOG.debug("Pending Entry: key={} key_sz={} file_id={} tstamp={} offset={} size={}", pendingEntry.key,
                     pendingEntry.key.length, pendingEntry.fileId, pendingEntry.tstamp, pendingEntry.offset,

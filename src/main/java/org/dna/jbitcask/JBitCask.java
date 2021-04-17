@@ -1,5 +1,6 @@
 package org.dna.jbitcask;
 
+import org.apache.commons.lang3.StringUtils;
 import org.dna.jbitcask.FileOperations.FileState;
 import org.dna.jbitcask.FileOperations.KeyFoldMode;
 import org.dna.jbitcask.FileOperations.KeyValueRecord;
@@ -156,14 +157,14 @@ public class JBitCask {
     static final int OFFSETFIELD_V1 = 64;
     static final int TOMBSTONEFIELD_V2 = 1;
     static final int OFFSETFIELD_V2 = 63;
-    static final int TSTAMPFIELD = 32;
-    static final int KEYSIZEFIELD = 16;
-    static final int TOTALSIZEFIELD = 32;
-    static final int VALSIZEFIELD = 32;
-    static final int CRCSIZEFIELD = 32;
+    static final int TSTAMPFIELD = 4; //32 bit
+    static final int KEYSIZEFIELD = 2; // 16 bit
+    static final int TOTALSIZEFIELD = 4; //32 bit
+    static final int VALSIZEFIELD = 4; // 32 bit
+    static final int CRCSIZEFIELD = 4; //32 bit
     static final int HEADER_SIZE = 14; // 4 + 4 + 2 + 4 bytes
     static final long MAXKEYSIZE = 0xFFFF;
-    static final long MAXVALSIZE = 0xFFFF_FFFF;
+    static final long MAXVALSIZE = Short.MAX_VALUE;
     static final long MAXOFFSET_V2 = 0x7FFF_FFFF_FFFF_FFFFL; //max 63-bit unsigned
 
     //for hintfile validation
@@ -328,7 +329,7 @@ public class JBitCask {
             final Optional<Long> maxSetuid = setuidFiles.stream().map(FileOperations::fileTimestamp).max(Long::compare);
             keydir.incrementFileId(maxSetuid.get());
         } catch (Exception ex) {
-            System.err.println("scan_key_files:");
+            LOG.error("scan_key_files:", ex);
             initKeydirScanKeyFiles(dirname, keydir, keyTransformer, count - 1);
         }
     }
@@ -405,7 +406,7 @@ public class JBitCask {
 
         final String writingFile2 = LockOperations.readActivefile(LockType.WRITE, dirname);
         final String mergingFile2 = LockOperations.readActivefile(LockType.MERGE, dirname);
-        if (writingFile.equals(writingFile2) && mergingFile.equals(mergingFile2)) {
+        if (StringUtils.equals(writingFile, writingFile2) && StringUtils.equals(mergingFile, mergingFile2)) {
             return fs.stream().collect(Collectors.partitioningBy(f -> ! JBitCask.hasPendingDeleteBit(f)));
         } else {
             // Changed while fetching file list, retry
@@ -558,10 +559,10 @@ public class JBitCask {
         } else {
             valSize = value.length;
         }
-        final FileOperations.WriteResponse res = FileOperations.checkWrite(state.writeFile, key, valSize, state.maxFileSize);
+        final FileOperations.WriteType res = FileOperations.checkWrite(state.writeFile, key, valSize, state.maxFileSize);
         BitcaskState state2;
         switch (res) {
-            case WRAP -> state2 = wrapWriteFile(this.state);
+            case WRAP -> state2 = wrapWriteFile(state);
             case FRESH -> {
                 final IO.BCFileLock writeLock = LockOperations.acquire(LockType.WRITE, state.dirname);
                 final FileState newWriteFile = FileOperations.createFile(state.dirname, state.opts, state.keydir);
@@ -575,7 +576,7 @@ public class JBitCask {
         }
         final long timestamp = System.currentTimeMillis();
         final FileState writeFile0 = state2.writeFile;
-        final long writeFileId = FileOperations.fileTimestamp(writeFile0);
+        final long writeFileId = writeFile0.getTimestamp();
         BitcaskState state3;
         if (JBitCask.isTombstone(value)) {
             final Keydir.EntryProxy entry;
@@ -598,7 +599,7 @@ public class JBitCask {
                 final FileOperations.WriteResult writeRes = FileOperations.write(state2.writeFile, key, tombstone.array(), timestamp);
                 final FileState writeFile2 = writeRes.fileState;
                 final int tombstoneSize = writeRes.size;
-                state2.keydir.updateFstats((int) FileOperations.fileTimestamp(writeFile2), timestamp,
+                state2.keydir.updateFstats((int) writeFile2.getTimestamp(), timestamp,
                         0, 0, 0, 0, tombstoneSize, true);
                 try {
                     state2.keydir.keydirRemove(key, oldTimestamp, oldFileId, oldOffset);
@@ -647,7 +648,7 @@ public class JBitCask {
     private BitcaskState writeAndKeydirPut(BitcaskState state, byte[] key, byte[] value, long timestamp, int retries,
                                            long nowTimestamp, int oldFileId, long oldOffset) throws IOException, LockOperations.AlreadyLockedException, InterruptedException {
         final FileOperations.WriteResult writeResult = FileOperations.write(state.writeFile, key, value, timestamp);
-        final int fileTimestamp = (int) FileOperations.fileTimestamp(writeResult.fileState);
+        final int fileTimestamp = (int) writeResult.fileState.getTimestamp();
 
         try {
             state.keydir.keydirPut(key, fileTimestamp, writeResult.size, writeResult.offset,
@@ -754,10 +755,10 @@ public class JBitCask {
         if (res != null) {
             return res;
         }
-        final String filename = FileOperations.mkFilename(dirname, fileId);
+        final Path filename = FileOperations.mkFilename(dirname, fileId);
         final FileState fileState;
         try {
-            fileState = FileOperations.openFile(Path.of(filename), openMode);
+            fileState = FileOperations.openFile(filename, openMode);
         } catch (FileNotFoundException fnfex) {
             // merge removed the file since the keydir_get
             throw fnfex;
@@ -900,7 +901,7 @@ public class JBitCask {
         List<FileState> inFiles = new ArrayList<>(inFiles2);
         inFiles.sort(Comparator.comparingLong(FileState::getTimestamp));
         final Set<Long> inFileIds = inFiles.stream()
-                .map(FileOperations::fileTimestamp)
+                .map(fileState -> fileState.getTimestamp())
                 .collect(Collectors.toSet());
         final long minFileId = readableFiles.stream()
                 .map(FileOperations::fileTimestamp)
@@ -965,7 +966,7 @@ public class JBitCask {
             return acc;
         }
         final FileState file = files.remove(0);
-        final long fileId = FileOperations.fileTimestamp(file);
+        final long fileId = file.getTimestamp();
 
         FileOperations.RecordFoldFunction<KeyFoldMode, FileOperations.KeyRecord> foldFunc = new FileOperations.RecordFoldFunction<KeyFoldMode, FileOperations.KeyRecord>() {
             @Override
@@ -1000,7 +1001,7 @@ public class JBitCask {
         }
         final FileState file = state.inputFiles.remove(0);
         final List<FileState> rest = state.inputFiles;
-        final long fileId = FileOperations.fileTimestamp(file);
+        final long fileId = file.getTimestamp();
 
         FileOperations.RecordFoldFunction<MergeState, KeyValueRecord> foldFunc = new FileOperations.RecordFoldFunction<MergeState, KeyValueRecord>() {
 
@@ -1176,7 +1177,7 @@ public class JBitCask {
             }
         };
         final FileOperations.WriteResult writeRes = FileOperations.write(state.outFile, key, value, timestamp);
-        final long outFileId = FileOperations.fileTimestamp(writeRes.fileState);
+        final long outFileId = writeRes.fileState.getTimestamp();
         if (outFileId <= oldFileId) {
             throw new InvariantViolationError(key, value, oldFileId, oldOffset, outFileId, writeRes.offset);
         }
