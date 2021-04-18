@@ -487,7 +487,8 @@ public class JBitCask {
         }
     }
 
-    private static List<Path> listDataFiles(String dirname, String writingFile, String mergingFile) {
+    // protected for test reasons
+    protected static List<Path> listDataFiles(String dirname, String writingFile, String mergingFile) {
         final List<FileOperations.TimeStampedFile> files = FileOperations.dataFileTimestamps(dirname);
         files.sort(FileOperations.TimeStampedFile::compareTo);
 

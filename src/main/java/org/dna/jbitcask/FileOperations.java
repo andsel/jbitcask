@@ -317,6 +317,11 @@ class FileOperations {
         public int compareTo(TimeStampedFile o) {
             return Long.compare(this.timestamp, o.timestamp);
         }
+
+        @Override
+        public String toString() {
+            return "timestamp: " + timestamp + ", filename: " + filename;
+        }
     }
 
     /**

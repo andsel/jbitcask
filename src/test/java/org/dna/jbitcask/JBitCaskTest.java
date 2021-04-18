@@ -10,9 +10,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,5 +72,24 @@ class JBitCaskTest {
         assertEquals("rw-------", permissions);
     }
 
-    
+    @Test
+    public void testListDataFiles() {
+        final boolean res = IntStream.range(8, 13) // Generate a list of files from 8->12
+                .mapToObj(i -> tempFolder.resolve(i + ".bitcask.data")) // Create each of the files
+                .allMatch(this::createFile);
+        assertTrue(res, "All files must be created");
+
+        // Now use the listDataFiles to scan the dir
+        final List<Path> expectedFiles = JBitCask.listDataFiles(tempFolder.toString(), null, null);
+        assertTrue(expectedFiles.isEmpty(), "No files should be found");
+    }
+
+    private boolean createFile(Path path) {
+        try {
+            return path.toFile().createNewFile();
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
 }
