@@ -145,7 +145,7 @@ class LockOperations {
     /**
      * Read the active filename stored in a given lockfile.
      * */
-    static String readActivefile(LockType type, String dirname) {
+    String readActivefile(LockType type, String dirname) {
         final Path lockFilename = lockFilename(type, dirname);
         try {
             final IO.BCFileLock bcFileLock = IO.lockAcquire(lockFilename, false);

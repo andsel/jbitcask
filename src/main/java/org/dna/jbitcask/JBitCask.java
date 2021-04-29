@@ -178,6 +178,9 @@ public class JBitCask {
     private byte tombstoneVersion;
     private boolean readWriteP;
 
+    // support services
+    private FileLister fileLister = new FileLister(new LockOperations());
+
     /**
      * A bitcask is a directory containing:
      * - One or more data files - {integer_timestamp}.bitcask.data
@@ -315,7 +318,8 @@ public class JBitCask {
             throw new BitCaskError("too many iterations");
         }
         try {
-            final Map<Boolean, List<Path>> files = readableAndSetuidFiles(dirname);
+            FileLister fileLister = new FileLister(new LockOperations());
+            final Map<Boolean, List<Path>> files = fileLister.readableAndSetuidFiles(dirname);
             final List<Path> sortedFiles = files.get(true);
             final List<Path> setuidFiles = files.get(false);
             scanKeyFiles(sortedFiles, keydir, new ArrayList<>(), true, keyTransformer);
@@ -389,28 +393,37 @@ public class JBitCask {
         return scanKeyFiles(rest, keydir, mergingList, closeFile, keyTransformer);
     }
 
-    private static List<Path> readableFiles(String dirname) {
-        final Map<Boolean, List<Path>> res = readableAndSetuidFiles(dirname);
-        return res.get(true);
-    }
+    static class FileLister {
 
-    private static Map<Boolean, List<Path>> readableAndSetuidFiles(String dirname) {
-        // Check the write and/or merge locks to see what files are currently
-        // being written to. Generate our list excepting those.
-        final String writingFile = LockOperations.readActivefile(LockType.WRITE, dirname);
-        final String mergingFile = LockOperations.readActivefile(LockType.MERGE, dirname);
+        private final LockOperations lockOperations;
 
-        // Filter out files with setuid bit set: they've been marked for
-        // deletion by an earlier *successful* merge.
-        final List<Path> fs = listDataFiles(dirname, writingFile, mergingFile);
+        FileLister(LockOperations lockOperations) {
+            this.lockOperations = lockOperations;
+        }
 
-        final String writingFile2 = LockOperations.readActivefile(LockType.WRITE, dirname);
-        final String mergingFile2 = LockOperations.readActivefile(LockType.MERGE, dirname);
-        if (StringUtils.equals(writingFile, writingFile2) && StringUtils.equals(mergingFile, mergingFile2)) {
-            return fs.stream().collect(Collectors.partitioningBy(f -> ! JBitCask.hasPendingDeleteBit(f)));
-        } else {
-            // Changed while fetching file list, retry
-            return readableAndSetuidFiles(dirname);
+        List<Path> readableFiles(String dirname) {
+            final Map<Boolean, List<Path>> res = readableAndSetuidFiles(dirname);
+            return res.get(true);
+        }
+
+        private Map<Boolean, List<Path>> readableAndSetuidFiles(String dirname) {
+            // Check the write and/or merge locks to see what files are currently
+            // being written to. Generate our list excepting those.
+            final String writingFile = lockOperations.readActivefile(LockType.WRITE, dirname);
+            final String mergingFile = lockOperations.readActivefile(LockType.MERGE, dirname);
+
+            // Filter out files with setuid bit set: they've been marked for
+            // deletion by an earlier *successful* merge.
+            final List<Path> fs = listDataFiles(dirname, writingFile, mergingFile);
+
+            final String writingFile2 = lockOperations.readActivefile(LockType.WRITE, dirname);
+            final String mergingFile2 = lockOperations.readActivefile(LockType.MERGE, dirname);
+            if (StringUtils.equals(writingFile, writingFile2) && StringUtils.equals(mergingFile, mergingFile2)) {
+                return fs.stream().collect(Collectors.partitioningBy(f -> !JBitCask.hasPendingDeleteBit(f)));
+            } else {
+                // Changed while fetching file list, retry
+                return readableAndSetuidFiles(dirname);
+            }
         }
     }
 
@@ -494,11 +507,10 @@ public class JBitCask {
 
         List<Path> res = new ArrayList<>();
         for (FileOperations.TimeStampedFile tf : files) {
-            if (writingFile != null && !tf.getFilename().toString().equals(writingFile)) {
-                res.add(tf.getFilename());
-            }
-            if (mergingFile != null && !tf.getFilename().toString().equals(mergingFile)) {
-                res.add(tf.getFilename());
+            if (writingFile != null && !tf.getFilename().getFileName().toString().equals(writingFile)) {
+                if (mergingFile != null && !tf.getFilename().getFileName().toString().equals(mergingFile)) {
+                    res.add(tf.getFilename());
+                }
             }
         }
         return res;
@@ -801,7 +813,8 @@ public class JBitCask {
     }
 
     private void merge(String dirname, Options options) throws IOException, InterruptedException {
-        merge(dirname, options, readableFiles(dirname), new ArrayList<>());
+        final List<Path> mergeFiles = fileLister.readableFiles(dirname);
+        merge(dirname, options, mergeFiles, new ArrayList<>());
     }
 
     private void merge(String dirname, Options options, List<Path> filesToMerge, List<Path> expiredFiles) throws IOException, InterruptedException {
@@ -878,7 +891,7 @@ public class JBitCask {
         // in the inFiles list loop above may have had an open
         // failure.  The open(2) shouldn't fail, except, of course, when it
         // does, e.g. EMFILE, ENFILE, the OS decides EINTR because "reasons", ...
-        final List<Path> readableFiles = readableFiles(dirname);
+        final List<Path> readableFiles = fileLister.readableFiles(dirname);
         readableFiles.removeAll(expiredFiles);
         Collections.sort(readableFiles);
 
